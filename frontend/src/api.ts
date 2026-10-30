@@ -192,7 +192,7 @@ export const api = {
     gold_sentiment: number
     usd_sentiment: number
     months: number
-    model?: string
+    model?: 'hybrid' | 'auto' | 'lightgbm' | 'prophet' | 'both' | 'drift'
   }) =>
     req<ForecastResponse>('/api/forecast', {
       method: 'POST',

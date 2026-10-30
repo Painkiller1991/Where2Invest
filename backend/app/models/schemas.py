@@ -47,7 +47,7 @@ class ForecastRequest(BaseModel):
     gold_sentiment: float = Field(ge=-10, le=10)
     usd_sentiment: float = Field(ge=-10, le=10)
     months: int = Field(ge=1, le=36)
-    model: Literal["lightgbm", "prophet", "both"] = "both"
+    model: Literal["hybrid", "auto", "lightgbm", "prophet", "both", "drift"] = "hybrid"
 
 
 class ForecastPoint(BaseModel):

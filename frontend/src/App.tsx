@@ -2,7 +2,9 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import {
   api,
   type DataStatus,
+  type ForecastPoint,
   type ForecastResponse,
+  type ForecastSeries,
   type InvestCompareResponse,
   type InvestContext,
   type InvestMonthStep,
@@ -13,7 +15,6 @@ import TradeChart from './components/TradeChart'
 const STEPS = [
   'آپدیت داده و چارت',
   'احساس و پیش‌بینی',
-  'تایید پیش‌بینی',
   'مدل‌های سرمایه‌گذاری',
   'مقایسه سود',
 ]
@@ -31,6 +32,112 @@ function fmtPct(n: number) {
   if (!Number.isFinite(n)) return '—'
   const sign = n > 0 ? '+' : ''
   return `${sign}${n.toFixed(1)}٪`
+}
+
+function fmtDate(ts: number) {
+  if (!Number.isFinite(ts) || ts <= 0) return '—'
+  return new Date(ts * 1000).toLocaleDateString('fa-IR')
+}
+
+type ForecastRangeStats = {
+  avg: number
+  min: number
+  minTime: number
+  max: number
+  maxTime: number
+  n: number
+}
+
+function computeForecastStats(points: ForecastPoint[]): ForecastRangeStats | null {
+  if (!points?.length) return null
+  let min = points[0]
+  let max = points[0]
+  let sum = 0
+  for (const p of points) {
+    sum += p.value
+    if (p.value < min.value) min = p
+    if (p.value > max.value) max = p
+  }
+  return {
+    avg: sum / points.length,
+    min: min.value,
+    minTime: min.time,
+    max: max.value,
+    maxTime: max.time,
+    n: points.length,
+  }
+}
+
+function RangeField({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  display,
+}: {
+  label: string
+  value: number
+  onChange: (n: number) => void
+  min: number
+  max: number
+  step?: number
+  display?: string
+}) {
+  return (
+    <label className="range-field">
+      <div className="range-head">
+        <span>{label}</span>
+        <strong dir="ltr">{display ?? String(value)}</strong>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      <div className="range-ends" dir="ltr">
+        <span>{min}</span>
+        <span>{max}</span>
+      </div>
+    </label>
+  )
+}
+
+function ForecastStatsCard({
+  title,
+  unit,
+  series,
+  digits = 0,
+}: {
+  title: string
+  unit: string
+  series: ForecastSeries
+  digits?: number
+}) {
+  const stats = useMemo(() => computeForecastStats(series.forecast || []), [series.forecast])
+  if (!stats) return null
+  return (
+    <div className="forecast-stats">
+      <p className="forecast-stats-title">{title}</p>
+      <ul>
+        <li>
+          میانگین بازه پیش‌بینی: <strong>{fmtMoney(stats.avg, digits)}</strong> {unit}
+        </li>
+        <li>
+          کمینه: <strong>{fmtMoney(stats.min, digits)}</strong> {unit}
+          <span className="muted"> — {fmtDate(stats.minTime)}</span>
+        </li>
+        <li>
+          بیشینه: <strong>{fmtMoney(stats.max, digits)}</strong> {unit}
+          <span className="muted"> — {fmtDate(stats.maxTime)}</span>
+        </li>
+      </ul>
+    </div>
+  )
 }
 
 function gram18From(ounce: number, usd: number) {
@@ -362,6 +469,9 @@ export default function App() {
   const [goldSentiment, setGoldSentiment] = useState(0)
   const [usdSentiment, setUsdSentiment] = useState(0)
   const [months, setMonths] = useState(3)
+  const [forecastModel, setForecastModel] = useState<
+    'hybrid' | 'auto' | 'lightgbm' | 'prophet' | 'both' | 'drift'
+  >('hybrid')
   const [forecast, setForecast] = useState<ForecastResponse | null>(null)
 
   const [capital, setCapital] = useState(100_000_000)
@@ -432,7 +542,7 @@ export default function App() {
         setConfigText(JSON.stringify(cfg, null, 2))
         await refreshStatus()
         setLoading(true)
-        showFlash('info', 'در حال بارگذاری / آپدیت داده از دیتابیس...')
+        setCalcNote('در حال بارگذاری / آپدیت داده از دیتابیس...')
         const s = await api.fetchData(sd, false)
         setStatus(s)
         if (!s.ready) {
@@ -449,6 +559,7 @@ export default function App() {
       } catch (e) {
         showFlash('error', 'خطا در شروع: ' + String(e))
       } finally {
+        setCalcNote(null)
         setLoading(false)
       }
     })()
@@ -458,7 +569,7 @@ export default function App() {
 
   const runFetch = async (force = false) => {
     setLoading(true)
-    showFlash('info', force ? 'در حال دانلود کامل...' : 'در حال آپدیت افزایشی...')
+    setCalcNote(force ? 'در حال دانلود کامل...' : 'در حال آپدیت افزایشی...')
     try {
       const s = await api.fetchData(startDate, force)
       setStatus(s)
@@ -477,6 +588,7 @@ export default function App() {
     } catch (e) {
       showFlash('error', 'خطا: ' + String(e))
     } finally {
+      setCalcNote(null)
       setLoading(false)
     }
   }
@@ -492,7 +604,7 @@ export default function App() {
 
   const saveConfigJson = async () => {
     setLoading(true)
-    showFlash('info', 'در حال ذخیره کانفیگ...')
+    setCalcNote('در حال ذخیره کانفیگ...')
     try {
       const parsed = JSON.parse(configText) as Record<string, unknown>
       await api.putConfig(parsed)
@@ -501,6 +613,7 @@ export default function App() {
     } catch (e) {
       showFlash('error', 'ذخیره کانفیگ ناموفق: ' + String(e))
     } finally {
+      setCalcNote(null)
       setLoading(false)
     }
   }
@@ -508,42 +621,44 @@ export default function App() {
   const runForecast = async () => {
     if (!dataReady) return
     setLoading(true)
-    showFlash('info', 'در حال اجرای پیش‌بینی...')
+    setCalcNote('در حال اجرای پیش‌بینی...')
     try {
       const fc = await api.forecast({
         gold_sentiment: goldSentiment,
         usd_sentiment: usdSentiment,
         months,
-        model: 'both',
+        model: forecastModel,
       })
       setForecast(fc)
-      setStep(2)
-      showFlash('success', `پیش‌بینی ${months} ماهه آماده شد.`)
+      setStep(1)
+      showFlash('success', `پیش‌بینی ${months} ماهه آماده شد — در صورت رضایت تایید کنید.`)
     } catch (e) {
       showFlash('error', 'پیش‌بینی ناموفق: ' + String(e))
     } finally {
+      setCalcNote(null)
       setLoading(false)
     }
   }
 
   const confirmAndContinue = async () => {
     setLoading(true)
-    showFlash('info', 'در حال تایید پیش‌بینی...')
+    setCalcNote('در حال تایید پیش‌بینی...')
     try {
       const fc = await api.confirmForecast(true)
       setForecast(fc)
-      setStep(3)
+      setStep(2)
       showFlash('success', 'پیش‌بینی تایید شد؛ می‌توانید مدل سرمایه‌گذاری را ادامه دهید.')
     } catch (e) {
       showFlash('error', 'تایید ناموفق: ' + String(e))
     } finally {
+      setCalcNote(null)
       setLoading(false)
     }
   }
 
   const suggestBudget = async () => {
     setLoading(true)
-    showFlash('info', 'در حال پیشنهاد بودجه ماهانه از روی اقساط...')
+    setCalcNote('در حال پیشنهاد بودجه ماهانه از روی اقساط...')
     try {
       const res = await api.investSuggestMonthly(investPayload())
       setMonthlyBudget(Math.ceil(res.suggested_monthly))
@@ -557,6 +672,7 @@ export default function App() {
     } catch (e) {
       showFlash('error', 'پیشنهاد بودجه ناموفق: ' + String(e))
     } finally {
+      setCalcNote(null)
       setLoading(false)
     }
   }
@@ -568,13 +684,12 @@ export default function App() {
     }
     setLoading(true)
     setCalcNote('در حال محاسبه مسیرها روی پیش‌بینی تاییدشده… صفحه را نبندید.')
-    showFlash('info', 'محاسبه شروع شد — جزئیات ثابت را همین‌جا ببینید.', 12000)
     try {
       const body = investPayload()
       const res = await api.investCompare(body)
       setExpandedMethod(res.best_method || res.results?.[0]?.method || null)
       setInvest(res)
-      setStep(4)
+      setStep(3)
       setCalcNote(null)
       showFlash('success', 'مقایسه آماده شد. توصیه و جدول پایین‌تر است.', 6000)
       window.setTimeout(() => {
@@ -593,20 +708,35 @@ export default function App() {
       showFlash('error', 'اول مرحله ۱ باید کامل شود (داده آماده نیست).')
       return
     }
-    if (i >= 3 && !forecast?.confirmed) {
-      showFlash('error', 'اول پیش‌بینی را در مرحله ۳ تایید کنید.')
+    if (i >= 2 && !forecast?.confirmed) {
+      showFlash('error', 'اول پیش‌بینی را در مرحله ۲ تایید کنید.')
       return
     }
     setStep(i)
   }
 
+  const sentimentLabel = (n: number) => {
+    if (n > 3) return `${n} · خیلی مثبت`
+    if (n > 0) return `${n} · مثبت`
+    if (n < -3) return `${n} · خیلی منفی`
+    if (n < 0) return `${n} · منفی`
+    return `${n} · خنثی`
+  }
+
+  const forecastStale = Boolean(
+    forecast &&
+      (forecast.gold_sentiment !== goldSentiment ||
+        forecast.usd_sentiment !== usdSentiment ||
+        forecast.months !== months),
+  )
+
   return (
     <div className="app">
-      <header className={`hero ${step >= 3 ? 'hero-compact' : ''}`}>
+      <header className={`hero ${step >= 2 ? 'hero-compact' : ''}`}>
         <div className="hero-bg" />
         <div className="hero-content">
           <p className="brand">Where2Invest</p>
-          {step < 3 ? (
+          {step < 2 ? (
             <>
               <h1>کجا سرمایه‌گذاری کنم؟</h1>
               <p className="tagline">دادهٔ انس و دلار آزاد، پیش‌بینی، و مقایسهٔ روش‌های سرمایه‌گذاری — لوکال</p>
@@ -631,7 +761,8 @@ export default function App() {
         ))}
       </nav>
 
-      {flash ? (
+      {/* حین لود فقط LoadingBlock؛ toast آبی info تکراری نشان داده نمی‌شود */}
+      {flash && !(loading && flash.kind === 'info') ? (
         <div className={`banner ${flash.kind}`} role="status">
           <span>{flash.text}</span>
           <button type="button" className="banner-close" onClick={() => setFlash(null)} aria-label="بستن">
@@ -641,13 +772,7 @@ export default function App() {
       ) : null}
       {loading ? (
         <div className="sticky-status">
-          <LoadingBlock
-            text={
-              calcNote ||
-              (flash?.kind === 'info' ? flash.text : null) ||
-              'در حال پردازش…'
-            }
-          />
+          <LoadingBlock text={calcNote || 'در حال پردازش…'} />
         </div>
       ) : null}
 
@@ -722,93 +847,121 @@ export default function App() {
 
       {step === 1 && (
         <section className="panel">
-          <h2>مرحله ۲ — احساس و افق پیش‌بینی</h2>
-          <div className="row form-grid">
-            <label>
-              احساس نمودار طلا (−۱۰ تا ۱۰)
-              <input
-                type="number"
-                min={-10}
-                max={10}
-                step={1}
-                value={goldSentiment}
-                onChange={(e) => setGoldSentiment(Number(e.target.value))}
-              />
-            </label>
-            <label>
-              احساس نمودار دلار (−۱۰ تا ۱۰)
-              <input
-                type="number"
-                min={-10}
-                max={10}
-                step={1}
-                value={usdSentiment}
-                onChange={(e) => setUsdSentiment(Number(e.target.value))}
-              />
-            </label>
-            <label>
-              افق (ماه)
-              <input
-                type="number"
-                min={1}
-                max={36}
-                value={months}
-                onChange={(e) => setMonths(Number(e.target.value))}
-              />
+          <h2>مرحله ۲ — احساس، پیش‌بینی و تایید</h2>
+          <p className="muted">اسلایدرها را بکش، پیش‌بینی بزن، نتیجه را ببین؛ اگر راضی بودی تایید کن.</p>
+
+          <div className="range-grid">
+            <RangeField
+              label="احساس طلا"
+              value={goldSentiment}
+              min={-10}
+              max={10}
+              onChange={setGoldSentiment}
+              display={sentimentLabel(goldSentiment)}
+            />
+            <RangeField
+              label="احساس دلار"
+              value={usdSentiment}
+              min={-10}
+              max={10}
+              onChange={setUsdSentiment}
+              display={sentimentLabel(usdSentiment)}
+            />
+            <RangeField
+              label="افق پیش‌بینی (ماه)"
+              value={months}
+              min={1}
+              max={36}
+              onChange={setMonths}
+              display={`${months} ماه`}
+            />
+            <label className="range-field">
+              <div className="range-head">
+                <span>مدل پیش‌بینی</span>
+              </div>
+              <select
+                value={forecastModel}
+                onChange={(e) => setForecastModel(e.target.value as typeof forecastModel)}
+              >
+                <option value="hybrid">Hybrid (بافت تاریخی + احساس)</option>
+                <option value="auto">Auto (Hybrid + LightGBM)</option>
+                <option value="both">Hybrid + LightGBM</option>
+                <option value="lightgbm">LightGBM (بازده + بافت)</option>
+                <option value="prophet">Prophet (بدون فصلی سالانه)</option>
+                <option value="drift">Drift + بافت</option>
+              </select>
             </label>
           </div>
+
           <div className="row">
             <button type="button" className="primary" onClick={runForecast} disabled={loading || !dataReady}>
-              اجرای پیش‌بینی (LightGBM + Prophet)
-            </button>
-          </div>
-        </section>
-      )}
-
-      {step === 2 && forecast && (
-        <section className="panel">
-          <h2>مرحله ۳ — واقعی در برابر پیش‌بینی</h2>
-          <p className="muted">
-            مدل طلا: {forecast.gold.model_used} | مدل دلار: {forecast.usd.model_used}
-          </p>
-          <TradeChart
-            title="انس طلا — واقعی / پیش‌بینی"
-            symbol="XAU/USD"
-            unit={forecast.gold.unit}
-            candles={forecast.gold.historical}
-            forecast={forecast.gold.forecast}
-          />
-          <TradeChart
-            title="دلار آزاد — واقعی / پیش‌بینی"
-            symbol="USD/IRT"
-            unit={forecast.usd.unit}
-            candles={forecast.usd.historical}
-            forecast={forecast.usd.forecast}
-          />
-          <div className="row">
-            <button type="button" className="primary" onClick={confirmAndContinue}>
-              تایید و ادامه
-            </button>
-            <button type="button" className="ghost" onClick={() => setStep(1)}>
-              ترین مجدد با ورودی متفاوت
+              {forecast ? 'اجرای دوباره پیش‌بینی' : 'اجرای پیش‌بینی'}
             </button>
             <button type="button" className="ghost" onClick={() => setStep(0)}>
               برگشت به چارت
             </button>
           </div>
+          {forecastStale && (
+            <p className="muted">اسلایدرها عوض شده‌اند — برای دیدن نتیجهٔ جدید دوباره «اجرای پیش‌بینی» را بزن.</p>
+          )}
+
+          {forecast && (
+            <>
+              <p className="muted">
+                مدل طلا: {forecast.gold.model_used} | مدل دلار: {forecast.usd.model_used}
+                {forecast.confirmed ? ' | تاییدشده' : ' | هنوز تایید نشده'}
+              </p>
+              <div className="forecast-stats-row">
+                <ForecastStatsCard
+                  title="آمار پیش‌بینی انس طلا"
+                  unit={forecast.gold.unit}
+                  series={forecast.gold}
+                  digits={1}
+                />
+                <ForecastStatsCard
+                  title="آمار پیش‌بینی دلار آزاد"
+                  unit="تومان"
+                  series={forecast.usd}
+                />
+              </div>
+              <TradeChart
+                title="انس طلا — واقعی / پیش‌بینی"
+                symbol="XAU/USD"
+                unit={forecast.gold.unit}
+                candles={forecast.gold.historical}
+                forecast={forecast.gold.forecast}
+              />
+              <TradeChart
+                title="دلار آزاد — واقعی / پیش‌بینی"
+                symbol="USD/IRT"
+                unit={forecast.usd.unit}
+                candles={forecast.usd.historical}
+                forecast={forecast.usd.forecast}
+              />
+              <div className="row">
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => (forecast.confirmed && !forecastStale ? setStep(2) : confirmAndContinue())}
+                  disabled={loading || forecastStale}
+                >
+                  {forecast.confirmed && !forecastStale
+                    ? 'رفتن به مدل‌های سرمایه‌گذاری'
+                    : 'تایید پیش‌بینی و ادامه'}
+                </button>
+              </div>
+            </>
+          )}
         </section>
       )}
 
-      {step === 3 && (
+      {step === 2 && (
         <section className="panel">
-          <h2>مرحله ۴ — مدل‌های سرمایه‌گذاری</h2>
+          <h2>مرحله ۳ — مدل‌های سرمایه‌گذاری</h2>
           <p className="muted">
             سه روش (فین‌تک، خرید مستقیم، بانک→وام) × طلا / دلار / صندوق. بودجه ماهانه برای مقایسه عادلانه مشترک است.
           </p>
           {localContext && <ContextFacts ctx={localContext} />}
-          {loading && (
-            <LoadingBlock text={calcNote || 'در حال محاسبه و مقایسه مسیرهای سرمایه‌گذاری…'} />
-          )}
 
           <h3 className="subhead">مشترک</h3>
           <div className="row form-grid">
@@ -1018,14 +1171,11 @@ export default function App() {
         </section>
       )}
 
-      {step === 4 && (
+      {step === 3 && (
         <section className="panel" ref={resultsRef}>
-          <h2>مرحله ۵ — مقایسه سود</h2>
-          {loading && (
-            <LoadingBlock text={calcNote || 'در حال آماده‌سازی نتایج…'} />
-          )}
+          <h2>مرحله ۴ — مقایسه سود</h2>
           {!invest && !loading && (
-            <p className="muted">هنوز نتیجه‌ای نیست. از مرحله ۴ محاسبه را بزنید.</p>
+            <p className="muted">هنوز نتیجه‌ای نیست. از مرحله ۳ محاسبه را بزنید.</p>
           )}
           {invest && (
             <>
@@ -1051,7 +1201,7 @@ export default function App() {
             </>
           )}
           <div className="row">
-            <button type="button" className="ghost" onClick={() => setStep(3)}>
+            <button type="button" className="ghost" onClick={() => setStep(2)}>
               تغییر ورودی سرمایه‌گذاری
             </button>
             <button type="button" className="ghost" onClick={() => setStep(1)}>

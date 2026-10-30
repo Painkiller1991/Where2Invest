@@ -574,6 +574,81 @@ select {
   margin-bottom: 0.75rem;
 }
 
+.range-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin: 1rem 0 1.25rem;
+}
+
+.range-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.range-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  font-size: 0.92rem;
+}
+
+.range-head strong {
+  color: var(--accent, #d4a017);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.range-field input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent, #d4a017);
+  cursor: pointer;
+}
+
+.range-ends {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.forecast-stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.85rem;
+  margin: 1rem 0;
+}
+
+.forecast-stats {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  background: rgba(212, 160, 23, 0.08);
+}
+
+.forecast-stats-title {
+  margin: 0 0 0.45rem;
+  color: var(--accent, #d4a017);
+  font-weight: 700;
+}
+
+.forecast-stats ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
 .loading-block {
   display: flex;
   align-items: center;
