@@ -1,0 +1,35 @@
+data:
+  history:
+    start_date: '2024-06-01'
+    end_date: null
+    interval: 1d
+  gold:
+    primary: yfinance
+    symbol: GC=F
+    fallback_symbol: XAUUSD=X
+  usd_irr:
+    primary: bonbast
+    fallback: tgju
+    symbol: usd
+    tgju_symbol: price_dollar_rl
+    unit: toman
+  retry:
+    max_attempts: 5
+    backoff_seconds:
+    - 2
+    - 5
+    - 10
+    - 20
+    - 40
+  cache_path: ./data/cache
+  http_proxy: null
+gold_ir:
+  constants:
+    troy_oz_grams: 31.1034768
+    mithqal_divisor: 9.5742
+server:
+  host: 127.0.0.1
+  port: 8000
+tgju:
+  profile_url: https://api.tgju.org/v1/market/indicator/summary-table-data/{symbol}
+  history_url: https://api.tgju.org/v1/market/indicator/summary-table-data/{symbol}
