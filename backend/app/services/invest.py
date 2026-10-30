@@ -7,7 +7,9 @@ from typing import Any
 from app.config_loader import load_config
 from app.models.schemas import (
     InvestCompareResponse,
+    InvestContext,
     InvestInput,
+    InvestMonthStep,
     InvestRecommendation,
     InvestResult,
     InvestSuggestResponse,
@@ -15,11 +17,13 @@ from app.models.schemas import (
 from app.services.forecast import get_last_forecast, is_confirmed
 from app.services.gold_iran_price import constants_from_config, gram18
 from app.services.loan_math import (
+    POINTS_DAYS_PER_MONTH,
     declining_balance_schedule,
     fund_value_from_cashflows,
     horizon_days,
     max_monthly_payment,
     month_to_day,
+    points_earned_in_month,
     remaining_principal_after_months,
 )
 
@@ -34,6 +38,12 @@ ASSET_TITLES = {
     "gold": "طلای گرم ۱۸",
     "usd": "دلار آزاد",
     "fund": "صندوق درآمد ثابت",
+}
+
+ASSET_UNIT_LABELS = {
+    "gold": "گرم طلا",
+    "usd": "دلار",
+    "fund": "",
 }
 
 
@@ -60,62 +70,99 @@ def _asset_prices(
         return list(usd)
     if asset == "gold":
         return [gram18(o, u, constants=consts, premium=0.0) for o, u in zip(oz, usd)]
-    # fund: unit NAV starts at 1; compounding handled separately
     return [1.0] * len(oz)
 
 
-def _lump_end(
-    investable: float,
-    asset: str,
-    prices: list[float],
-    fund_annual_pct: float,
-    total_days: int,
-    buy_month: int = 0,
-) -> float:
-    if investable <= 0:
-        return 0.0
-    if asset == "fund":
-        day = month_to_day(buy_month)
-        return fund_value_from_cashflows([(day, investable)], fund_annual_pct, total_days)
-    px0 = prices[buy_month]
-    px_h = prices[-1]
-    if px0 <= 0:
-        return 0.0
-    return (investable / px0) * px_h
+class _Book:
+    """Mark-to-market book for gold/usd units or fund cashflows."""
+
+    def __init__(self, asset: str, prices: list[float], fund_annual_pct: float) -> None:
+        self.asset = asset
+        self.prices = prices
+        self.fund_annual_pct = fund_annual_pct
+        self.units = 0.0
+        self.flows: list[tuple[int, float]] = []
+
+    def buy(self, amount: float, month: int) -> float:
+        """خرید به تومان؛ مقدار واحد خریده‌شده را برمی‌گرداند (دلار/گرم)."""
+        if amount <= 1e-9:
+            return 0.0
+        m = max(0, min(int(month), len(self.prices) - 1))
+        if self.asset == "fund":
+            self.flows.append((month_to_day(m), amount))
+            return 0.0
+        px = self.prices[m]
+        if px <= 0:
+            return 0.0
+        got = amount / px
+        self.units += got
+        return got
+
+    def value(self, month: int) -> float:
+        m = max(0, min(int(month), len(self.prices) - 1))
+        if self.asset == "fund":
+            return fund_value_from_cashflows(self.flows, self.fund_annual_pct, month_to_day(m))
+        return self.units * self.prices[m]
+
+    def price(self, month: int) -> float:
+        m = max(0, min(int(month), len(self.prices) - 1))
+        if self.asset == "fund":
+            contributed = sum(a for _, a in self.flows)
+            v = self.value(m)
+            return (v / contributed) if contributed > 1e-9 else 1.0
+        return self.prices[m]
 
 
-def _dca_end(
-    initial: float,
-    monthly: float,
-    asset: str,
-    prices: list[float],
-    fund_annual_pct: float,
-    total_days: int,
-    h: int,
+def _unit_label(asset: str) -> str:
+    return ASSET_UNIT_LABELS.get(asset, "")
+
+
+def _fmt_units(n: float, asset: str) -> str:
+    label = _unit_label(asset)
+    if not label:
+        return ""
+    if asset == "usd":
+        return f"{n:,.2f} {label}"
+    return f"{n:,.4f} {label}"
+
+
+def _step(
     *,
-    start_month: int = 1,
-    end_month: int | None = None,
-    initial_month: int = 0,
-) -> float:
-    """Initial buy at initial_month + monthly buys from start_month..end_month."""
-    end_m = h if end_month is None else end_month
-    if asset == "fund":
-        flows: list[tuple[int, float]] = []
-        if initial > 0:
-            flows.append((month_to_day(initial_month), initial))
-        for m in range(start_month, end_m + 1):
-            if monthly > 0:
-                flows.append((month_to_day(m), monthly))
-        return fund_value_from_cashflows(flows, fund_annual_pct, total_days)
-
-    units = 0.0
-    if initial > 0 and prices[initial_month] > 0:
-        units += initial / prices[initial_month]
-    for m in range(start_month, end_m + 1):
-        px = prices[m]
-        if monthly > 0 and px > 0:
-            units += monthly / px
-    return units * prices[-1]
+    month: int,
+    label: str,
+    events: list[str],
+    cash_in: float = 0.0,
+    buy: float = 0.0,
+    installment: float = 0.0,
+    points: float = 0.0,
+    deposit: float = 0.0,
+    debt: float = 0.0,
+    asset_value: float = 0.0,
+    cash: float = 0.0,
+    price: float = 0.0,
+    units_bought: float = 0.0,
+    units_held: float = 0.0,
+    unit_label: str = "",
+) -> InvestMonthStep:
+    wealth = asset_value + cash + deposit
+    return InvestMonthStep(
+        month=month,
+        label=label,
+        events=events,
+        cash_in=cash_in,
+        buy=buy,
+        installment=installment,
+        points=points,
+        deposit=deposit,
+        debt=debt,
+        asset_value=asset_value,
+        cash=cash,
+        wealth=wealth,
+        price=price,
+        units_bought=units_bought,
+        units_held=units_held,
+        unit_label=unit_label,
+    )
 
 
 def _row(
@@ -128,12 +175,16 @@ def _row(
     remaining_debt: float,
     notes: str,
     valid: bool = True,
+    timeline: list[InvestMonthStep] | None = None,
+    units_held: float = 0.0,
+    end_price: float = 0.0,
 ) -> InvestResult:
     wealth = end_value
     net = wealth - remaining_debt - total_cash_in
     pct = (net / total_cash_in * 100.0) if total_cash_in > 0 else 0.0
     method = f"{model}__{asset}"
     title = f"{MODEL_TITLES[model]} → {ASSET_TITLES[asset]}"
+    ul = _unit_label(asset)
     return InvestResult(
         method=method,
         model=model,
@@ -147,6 +198,10 @@ def _row(
         profit_pct=pct,
         notes=notes if valid else f"نامعتبر: {notes}",
         valid=valid,
+        timeline=timeline or [],
+        units_held=units_held,
+        unit_label=ul,
+        end_price=end_price,
     )
 
 
@@ -161,6 +216,405 @@ def _enabled_assets(payload: InvestInput) -> list[str]:
     return out
 
 
+def _loan_per_point(payload: InvestInput) -> float:
+    return float(payload.loan_for_points) / max(float(payload.points_for_loan), 1e-9)
+
+
+def _sim_direct(
+    *,
+    capital: float,
+    monthly: float,
+    asset: str,
+    prices: list[float],
+    fund_annual_pct: float,
+    h: int,
+) -> tuple[float, list[InvestMonthStep], float, float]:
+    book = _Book(asset, prices, fund_annual_pct)
+    ul = _unit_label(asset)
+    timeline: list[InvestMonthStep] = []
+    u0 = book.buy(capital, 0)
+    events0 = [f"خرید اولیه سرمایه {capital:,.0f} تومان"]
+    if ul and u0 > 0:
+        events0.append(f"≈ {_fmt_units(u0, asset)} @ {book.price(0):,.0f}")
+    timeline.append(
+        _step(
+            month=0,
+            label="شروع",
+            events=events0,
+            cash_in=capital,
+            buy=capital,
+            asset_value=book.value(0),
+            price=book.price(0),
+            units_bought=u0,
+            units_held=book.units,
+            unit_label=ul,
+        )
+    )
+    for m in range(1, h + 1):
+        um = book.buy(monthly, m)
+        events = [f"خرید DCA ماهانه {monthly:,.0f} تومان"] if monthly > 0 else ["بدون خرید ماهانه"]
+        if ul and um > 0:
+            events.append(f"≈ {_fmt_units(um, asset)} @ {book.price(m):,.0f}")
+        timeline.append(
+            _step(
+                month=m,
+                label=f"ماه {m}",
+                events=events,
+                cash_in=monthly,
+                buy=monthly,
+                asset_value=book.value(m),
+                price=book.price(m),
+                units_bought=um,
+                units_held=book.units,
+                unit_label=ul,
+            )
+        )
+    return book.value(h), timeline, book.units, book.price(h)
+
+
+def _sim_fintech(
+    *,
+    capital: float,
+    monthly: float,
+    loan_amount: float,
+    fee: float,
+    fee_source: str,
+    asset: str,
+    prices: list[float],
+    fund_annual_pct: float,
+    h: int,
+    sched: list[Any],
+) -> tuple[float, float, float, bool, list[str], list[InvestMonthStep], float, float]:
+    notes: list[str] = [
+        f"وام {loan_amount:,.0f}",
+        f"کارمزد {fee:,.0f} ({fee_source})",
+    ]
+    valid = True
+    max_pay = max_monthly_payment(sched)
+    notes.append(f"قسط اول ~{max_pay:,.0f}")
+    if max_pay > monthly + 1e-6:
+        valid = False
+        notes.append(f"قسط بیشتر از بودجه ماهانه ({monthly:,.0f})")
+
+    leftover = 0.0
+    investable = 0.0
+    if fee_source == "cash":
+        if capital + 1e-6 < fee:
+            valid = False
+            notes.append("سرمایه برای کارمزد کافی نیست")
+            investable = 0.0
+            leftover = capital
+        else:
+            investable = loan_amount
+            leftover = capital - fee
+    else:
+        investable = loan_amount - fee
+        leftover = capital
+
+    book = _Book(asset, prices, fund_annual_pct)
+    ul = _unit_label(asset)
+    timeline: list[InvestMonthStep] = []
+    events0 = [
+        f"دریافت وام {loan_amount:,.0f}",
+        f"کسر کارمزد {fee:,.0f}",
+        f"خرید دارایی {investable:,.0f}",
+    ]
+    if leftover > 0:
+        events0.append(f"مانده نقد {leftover:,.0f}")
+    u0 = book.buy(investable, 0)
+    if ul and u0 > 0:
+        events0.append(f"≈ {_fmt_units(u0, asset)} @ {book.price(0):,.0f}")
+    debt0 = loan_amount
+    timeline.append(
+        _step(
+            month=0,
+            label="شروع",
+            events=events0,
+            cash_in=capital,
+            buy=investable,
+            debt=debt0,
+            asset_value=book.value(0),
+            cash=leftover,
+            price=book.price(0),
+            units_bought=u0,
+            units_held=book.units,
+            unit_label=ul,
+        )
+    )
+
+    debt = debt0
+    for m in range(1, h + 1):
+        events: list[str] = []
+        installment = 0.0
+        buy = 0.0
+        um = 0.0
+        if m <= len(sched):
+            inst = sched[m - 1]
+            installment = inst.payment
+            debt = inst.remaining
+            events.append(f"پرداخت قسط {installment:,.0f} (اصل {inst.principal:,.0f} + بهره {inst.interest:,.0f})")
+            surplus = monthly - installment
+            if surplus > 1e-6:
+                um = book.buy(surplus, m)
+                buy = surplus
+                events.append(f"مانده بودجه → خرید {surplus:,.0f}")
+                if ul and um > 0:
+                    events.append(f"≈ {_fmt_units(um, asset)}")
+            elif surplus < -1e-6:
+                events.append("بودجه کمتر از قسط")
+        else:
+            debt = 0.0
+            if monthly > 1e-6:
+                um = book.buy(monthly, m)
+                buy = monthly
+                events.append(f"پس از تسویه؛ خرید ماهانه {monthly:,.0f}")
+                if ul and um > 0:
+                    events.append(f"≈ {_fmt_units(um, asset)}")
+            else:
+                events.append("پس از تسویه وام")
+        timeline.append(
+            _step(
+                month=m,
+                label=f"ماه {m}",
+                events=events,
+                cash_in=monthly,
+                buy=buy,
+                installment=installment,
+                debt=debt,
+                asset_value=book.value(m),
+                cash=leftover,
+                price=book.price(m),
+                units_bought=um,
+                units_held=book.units,
+                unit_label=ul,
+            )
+        )
+
+    months_paid = min(h, len(sched))
+    rem_debt = remaining_principal_after_months(sched, months_paid) if sched else 0.0
+    end_value = book.value(h) + leftover
+    return end_value, rem_debt, investable, valid, notes, timeline, book.units, book.price(h)
+
+
+def _sim_bank(
+    *,
+    capital: float,
+    monthly: float,
+    asset: str,
+    prices: list[float],
+    fund_annual_pct: float,
+    h: int,
+    to_bank: bool,
+    toman_per_point: float,
+    points_needed: float,
+    loan_for_points: float,
+    model3_bank_annual_pct: float,
+    repay_months_model3: int | None,
+) -> tuple[float, float, float, bool, list[str], list[InvestMonthStep], float, float]:
+    tpp = max(float(toman_per_point), 1e-9)
+    need = max(float(points_needed), 0.0)
+    deposit = max(float(capital), 0.0)
+    points = 0.0
+    unlocked = False
+    wait = h
+    loan = 0.0
+    debt = 0.0
+    sched: list[Any] = []
+    pay_i = 0
+    book = _Book(asset, prices, fund_annual_pct)
+    ul = _unit_label(asset)
+    timeline: list[InvestMonthStep] = []
+    investable = 0.0
+
+    timeline.append(
+        _step(
+            month=0,
+            label="شروع",
+            events=[f"موجودی اولیه برای امتیاز {deposit:,.0f} تومان"],
+            cash_in=capital,
+            deposit=deposit,
+            points=0.0,
+            asset_value=0.0,
+            cash=0.0,
+            price=book.price(0),
+            unit_label=ul,
+        )
+    )
+
+    for m in range(1, h + 1):
+        events: list[str] = []
+        buy = 0.0
+        um = 0.0
+        installment = 0.0
+        cash_in = monthly
+
+        if not unlocked:
+            daily_pts = deposit / tpp
+            gained = points_earned_in_month(deposit, tpp)
+            points += gained
+            events.append(
+                f"امتیاز روزانه ≈{daily_pts:.1f} × {POINTS_DAYS_PER_MONTH} روز "
+                f"= +{gained:.1f} → جمع {points:.1f}/{need:g}"
+            )
+            if points + 1e-9 >= need:
+                unlocked = True
+                wait = m
+                loan = float(loan_for_points)
+                debt = loan
+                unlock_cash = deposit + loan
+                investable = unlock_cash
+                um += book.buy(unlock_cash, m)
+                buy += unlock_cash
+                events.append(f"رسیدن به امتیاز؛ آزادسازی وام {loan:,.0f}")
+                events.append(f"خرید یکجا سپرده+وام {unlock_cash:,.0f}")
+                if ul and um > 0:
+                    events.append(f"≈ {_fmt_units(um, asset)} @ {book.price(m):,.0f}")
+                deposit = 0.0
+                repay_n = max(1, int(repay_months_model3) if repay_months_model3 else 12)
+                use_inst = model3_bank_annual_pct > 0 and loan > 0
+                if use_inst:
+                    sched = declining_balance_schedule(loan, model3_bank_annual_pct, repay_n)
+                    events.append(f"شروع اقساط {repay_n} ماهه (قسط اول ~{max_monthly_payment(sched):,.0f})")
+                else:
+                    events.append("وام بدون بهره؛ اصل در پایان افق می‌ماند")
+                if monthly > 1e-6:
+                    u_m = book.buy(monthly, m)
+                    um += u_m
+                    buy += monthly
+                    events.append(f"بودجه ماه آزادسازی → خرید {monthly:,.0f}")
+                    if ul and u_m > 0:
+                        events.append(f"≈ {_fmt_units(u_m, asset)}")
+            else:
+                if to_bank:
+                    deposit += monthly
+                    events.append(f"واریز ماهانه به بانک؛ سپرده {deposit:,.0f}")
+                else:
+                    um = book.buy(monthly, m)
+                    buy = monthly
+                    events.append(f"خرید ماهانه دارایی {monthly:,.0f}؛ سپرده امتیاز {deposit:,.0f}")
+                    if ul and um > 0:
+                        events.append(f"≈ {_fmt_units(um, asset)} @ {book.price(m):,.0f}")
+        else:
+            use_inst = bool(sched)
+            if use_inst and pay_i < len(sched):
+                inst = sched[pay_i]
+                installment = inst.payment
+                debt = inst.remaining
+                pay_i += 1
+                events.append(
+                    f"قسط {pay_i}/{len(sched)}: {installment:,.0f} "
+                    f"(اصل {inst.principal:,.0f} + بهره {inst.interest:,.0f})"
+                )
+                surplus = monthly - installment
+                if surplus > 1e-6:
+                    um = book.buy(surplus, m)
+                    buy = surplus
+                    events.append(f"مانده بودجه → خرید {surplus:,.0f}")
+                    if ul and um > 0:
+                        events.append(f"≈ {_fmt_units(um, asset)}")
+                elif surplus < -1e-6:
+                    events.append("بودجه کمتر از قسط")
+            else:
+                if monthly > 1e-6:
+                    um = book.buy(monthly, m)
+                    buy = monthly
+                    events.append(f"خرید ماهانه {monthly:,.0f}")
+                    if ul and um > 0:
+                        events.append(f"≈ {_fmt_units(um, asset)}")
+                if not use_inst and loan > 0:
+                    debt = loan
+                    events.append(f"بدهی بدون بهره باقی‌مانده {debt:,.0f}")
+
+        timeline.append(
+            _step(
+                month=m,
+                label=f"ماه {m}",
+                events=events,
+                cash_in=cash_in,
+                buy=buy,
+                installment=installment,
+                points=points,
+                deposit=deposit,
+                debt=debt,
+                asset_value=book.value(m),
+                cash=0.0,
+                price=book.price(m),
+                units_bought=um,
+                units_held=book.units,
+                unit_label=ul,
+            )
+        )
+
+    reached = unlocked
+    notes: list[str] = [
+        f"انتظار محاسبه‌شده {wait} ماه",
+        f"امتیاز {points:.1f} (نیاز {need:g})",
+        f"سپرده در آزادسازی {(investable - loan) if reached else deposit:,.0f}",
+        f"وام {loan:,.0f}",
+    ]
+    valid = True
+    if not reached:
+        valid = False
+        notes.append("تا پایان افق به امتیاز لازم نرسید — بدون آزادسازی وام")
+        if to_bank:
+            end_value = deposit
+            if timeline:
+                last = timeline[-1]
+                timeline[-1] = last.model_copy(
+                    update={
+                        "events": list(last.events) + [f"پایان افق؛ سپرده نقدی {deposit:,.0f} بدون وام"],
+                        "asset_value": 0.0,
+                        "deposit": deposit,
+                        "wealth": deposit,
+                        "debt": 0.0,
+                        "units_held": 0.0,
+                    }
+                )
+            rem_debt = 0.0
+            investable = deposit
+        else:
+            if deposit > 1e-6:
+                u_end = book.buy(deposit, h)
+                if timeline:
+                    last = timeline[-1]
+                    extra = [f"پایان افق؛ تبدیل سپرده امتیاز {deposit:,.0f} به دارایی"]
+                    if ul and u_end > 0:
+                        extra.append(f"≈ {_fmt_units(u_end, asset)}")
+                    timeline[-1] = last.model_copy(
+                        update={
+                            "events": list(last.events) + extra,
+                            "buy": last.buy + deposit,
+                            "deposit": 0.0,
+                            "asset_value": book.value(h),
+                            "wealth": book.value(h),
+                            "units_bought": last.units_bought + u_end,
+                            "units_held": book.units,
+                        }
+                    )
+                deposit = 0.0
+            end_value = book.value(h)
+            rem_debt = 0.0
+            investable = capital
+    else:
+        use_inst = bool(sched)
+        max_pay3 = max_monthly_payment(sched) if sched else 0.0
+        if use_inst:
+            if max_pay3 > monthly + 1e-6:
+                valid = False
+                notes.append(f"قسط اول قرارداد ~{max_pay3:,.0f} بیش از بودجه ماهانه")
+            notes.append(
+                f"اقساط {len(sched)} ماهه (قسط اول ~{max_pay3:,.0f})؛ "
+                f"در افق {pay_i} قسط؛ مانده بدهی {debt:,.0f}"
+            )
+            rem_debt = debt
+        else:
+            rem_debt = loan
+            notes.append("بدون بهره وام؛ تسویه اصل در پایان افق")
+        end_value = book.value(h)
+
+    return end_value, rem_debt, investable, valid, notes, timeline, book.units, book.price(h)
+
+
 def suggest_monthly_budget(payload: InvestInput) -> InvestSuggestResponse:
     details: dict[str, float] = {}
     if payload.enable_fintech and payload.loan_amount > 0 and payload.repay_months > 0:
@@ -168,24 +622,10 @@ def suggest_monthly_budget(payload: InvestInput) -> InvestSuggestResponse:
             payload.loan_amount, payload.bank_annual_pct, payload.repay_months
         )
         details["fintech"] = max_monthly_payment(sched)
-    if payload.enable_bank_to_bank or payload.enable_bank_to_asset:
-        if payload.model3_bank_annual_pct > 0:
-            deposit = payload.capital_toman
-            if payload.enable_bank_to_bank:
-                # upper bound suggestion uses max possible loan (with monthly to bank)
-                # use wait_months from payload; for suggest we don't know H yet — use deposit+wait
-                pass
-            loan_a = (
-                int(payload.capital_toman // max(payload.toman_per_point, 1))
-                * payload.loan_per_point
-            )
-            # for to_bank path loan can be larger; estimate with wait months of budget unknown
-            # use capital-only loan for floor; if monthly known use it
-            if payload.monthly_budget_toman > 0 and payload.enable_bank_to_bank:
-                dep = payload.capital_toman + payload.monthly_budget_toman * payload.wait_months
-                loan_b = int(dep // max(payload.toman_per_point, 1)) * payload.loan_per_point
-                loan_a = max(loan_a, loan_b)
-            n = payload.repay_months_model3 or 12
+    if (payload.enable_bank_to_bank or payload.enable_bank_to_asset) and payload.model3_bank_annual_pct > 0:
+        loan_a = float(payload.loan_for_points)
+        n = max(1, int(payload.repay_months_model3) if payload.repay_months_model3 else 12)
+        if loan_a > 0:
             sched3 = declining_balance_schedule(loan_a, payload.model3_bank_annual_pct, n)
             details["bank_loan"] = max_monthly_payment(sched3)
     suggested = max(details.values()) if details else 0.0
@@ -202,7 +642,6 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
     cfg = load_config()
     consts = constants_from_config(cfg)
     h = int(fc.months)
-    total_days = horizon_days(h)
     total_cash_in = payload.capital_toman + payload.monthly_budget_toman * h
     monthly = payload.monthly_budget_toman
 
@@ -230,37 +669,19 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
         sched = declining_balance_schedule(
             payload.loan_amount, payload.bank_annual_pct, payload.repay_months
         )
-        max_pay = max_monthly_payment(sched)
-        months_paid = min(h, payload.repay_months)
-        rem_debt = remaining_principal_after_months(sched, months_paid)
-
         for asset in assets:
-            notes_parts = [
-                f"وام {payload.loan_amount:,.0f}",
-                f"کارمزد {fee:,.0f} ({payload.fee_source})",
-                f"قسط اول ~{max_pay:,.0f}",
-            ]
-            valid = True
-            if max_pay > monthly + 1e-6:
-                valid = False
-                notes_parts.append(f"قسط بیشتر از بودجه ماهانه ({monthly:,.0f})")
-
-            leftover = 0.0
-            if payload.fee_source == "cash":
-                if payload.capital_toman + 1e-6 < fee:
-                    valid = False
-                    notes_parts.append("سرمایه برای کارمزد کافی نیست")
-                    investable = 0.0
-                else:
-                    investable = payload.loan_amount
-                    leftover = payload.capital_toman - fee
-            else:
-                investable = payload.loan_amount - fee
-                leftover = payload.capital_toman
-
-            px = prices_for(asset)
-            asset_end = _lump_end(investable, asset, px, payload.fund_annual_pct, total_days, 0)
-            end_value = asset_end + leftover
+            end_value, rem_debt, investable, valid, notes_parts, timeline, units_held, end_px = _sim_fintech(
+                capital=payload.capital_toman,
+                monthly=monthly,
+                loan_amount=payload.loan_amount,
+                fee=fee,
+                fee_source=payload.fee_source,
+                asset=asset,
+                prices=prices_for(asset),
+                fund_annual_pct=payload.fund_annual_pct,
+                h=h,
+                sched=sched,
+            )
             results.append(
                 _row(
                     model="fintech_loan",
@@ -268,24 +689,25 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
                     investable=investable,
                     total_cash_in=total_cash_in,
                     end_value=end_value,
-                    remaining_debt=rem_debt if valid else rem_debt,
+                    remaining_debt=rem_debt,
                     notes="؛ ".join(notes_parts),
                     valid=valid,
+                    timeline=timeline,
+                    units_held=units_held,
+                    end_price=end_px,
                 )
             )
 
     # ——— مدل ۲: خرید مستقیم ———
     if payload.enable_direct:
         for asset in assets:
-            px = prices_for(asset)
-            end_value = _dca_end(
-                payload.capital_toman,
-                monthly,
-                asset,
-                px,
-                payload.fund_annual_pct,
-                total_days,
-                h,
+            end_value, timeline, units_held, end_px = _sim_direct(
+                capital=payload.capital_toman,
+                monthly=monthly,
+                asset=asset,
+                prices=prices_for(asset),
+                fund_annual_pct=payload.fund_annual_pct,
+                h=h,
             )
             results.append(
                 _row(
@@ -297,112 +719,42 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
                     remaining_debt=0.0,
                     notes=f"خرید اولیه + DCA ماهانه {monthly:,.0f} تومان",
                     valid=True,
+                    timeline=timeline,
+                    units_held=units_held,
+                    end_price=end_px,
                 )
             )
 
     # ——— مدل ۳: بانک → وام ———
-    wait = min(payload.wait_months, h)
-    repay_n = payload.repay_months_model3 or max(1, h - wait)
-
     def bank_paths(model_key: str, to_bank: bool) -> None:
-        if to_bank:
-            deposit = payload.capital_toman + monthly * wait
-        else:
-            deposit = payload.capital_toman
-        points = int(deposit // max(payload.toman_per_point, 1e-9))
-        loan = points * payload.loan_per_point
-        use_installments = payload.model3_bank_annual_pct > 0 and loan > 0
-        sched3 = (
-            declining_balance_schedule(loan, payload.model3_bank_annual_pct, repay_n)
-            if use_installments
-            else []
-        )
-        max_pay3 = max_monthly_payment(sched3) if sched3 else 0.0
-
         for asset in assets:
-            px = prices_for(asset)
-            notes: list[str] = [
-                f"انتظار {wait} ماه",
-                f"سپرده مبنای وام {deposit:,.0f}",
-                f"وام {loan:,.0f}",
-            ]
-            valid = True
-            leftover_cash = 0.0
-
-            if to_bank:
-                # months 1..wait: budget to bank (already in deposit); no asset buy
-                pre_units_end = 0.0
-            else:
-                # months 1..wait: DCA asset with monthly (capital stays in bank)
-                pre_units_end = _dca_end(
-                    0.0,
-                    monthly,
-                    asset,
-                    px,
-                    payload.fund_annual_pct,
-                    total_days,
-                    h,
-                    start_month=1,
-                    end_month=wait,
-                    initial_month=0,
-                )
-
-            unlock_cash = deposit + loan  # deposit returns + loan
-            # buy lump at wait month
-            lump = _lump_end(
-                unlock_cash,
-                asset,
-                px,
-                payload.fund_annual_pct,
-                total_days,
-                buy_month=wait,
+            end_value, rem_debt, investable, valid, notes, timeline, units_held, end_px = _sim_bank(
+                capital=payload.capital_toman,
+                monthly=monthly,
+                asset=asset,
+                prices=prices_for(asset),
+                fund_annual_pct=payload.fund_annual_pct,
+                h=h,
+                to_bank=to_bank,
+                toman_per_point=payload.toman_per_point,
+                points_needed=payload.points_for_loan,
+                loan_for_points=payload.loan_for_points,
+                model3_bank_annual_pct=payload.model3_bank_annual_pct,
+                repay_months_model3=payload.repay_months_model3,
             )
-
-            rem_debt = 0.0
-            if use_installments:
-                if max_pay3 > monthly + 1e-6:
-                    valid = False
-                    notes.append(f"قسط {max_pay3:,.0f} بیش از بودجه")
-                # installments from month wait+1
-                months_after = max(0, h - wait)
-                paid_count = min(months_after, repay_n)
-                rem_debt = remaining_principal_after_months(sched3, paid_count)
-                notes.append(f"اقساط بعد از آزادسازی؛ مانده بدهی {rem_debt:,.0f}")
-                # no further DCA; asset = pre + lump only
-                end_value = pre_units_end + lump + leftover_cash
-            else:
-                # after unlock: continue DCA months wait+1..H
-                post = _dca_end(
-                    0.0,
-                    monthly,
-                    asset,
-                    px,
-                    payload.fund_annual_pct,
-                    total_days,
-                    h,
-                    start_month=wait + 1,
-                    end_month=h,
-                    initial_month=0,
-                )
-                # At horizon we still owe the loan principal (simple payoff)
-                rem_debt = loan
-                notes.append("بدون بهره وام؛ تسویه اصل در پایان افق")
-                end_value = pre_units_end + lump + post + leftover_cash
-
-            # When to_bank, deposit includes monthly*wait which is part of total_cash_in;
-            # unlock spends deposit+loan into asset — good.
-            # Capital is in total_cash_in; deposit return is inside lump — don't double count cash.
-
             results.append(
                 _row(
                     model=model_key,
                     asset=asset,
-                    investable=unlock_cash,
+                    investable=investable,
                     total_cash_in=total_cash_in,
                     end_value=end_value,
                     remaining_debt=rem_debt,
                     notes="؛ ".join(notes),
                     valid=valid,
+                    timeline=timeline,
+                    units_held=units_held,
+                    end_price=end_px,
                 )
             )
 
@@ -441,6 +793,36 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
             message=msg,
         )
 
+    g0 = gram18(oz0, usd0, constants=consts, premium=0.0)
+    g1 = gram18(oz[-1], usd[-1], constants=consts, premium=0.0)
+
+    def _pct(a: float, b: float) -> float:
+        return ((b - a) / a * 100.0) if a else 0.0
+
+    context = InvestContext(
+        horizon_months=h,
+        usd_now=usd0,
+        usd_end=usd[-1],
+        usd_change_pct=_pct(usd0, usd[-1]),
+        ounce_now=oz0,
+        ounce_end=oz[-1],
+        ounce_change_pct=_pct(oz0, oz[-1]),
+        gram18_now=g0,
+        gram18_end=g1,
+        gram18_change_pct=_pct(g0, g1),
+        capital_toman=payload.capital_toman,
+        monthly_budget_toman=monthly,
+        total_cash_in=total_cash_in,
+        capital_as_usd_now=(payload.capital_toman / usd0) if usd0 else 0.0,
+        capital_as_gram18_now=(payload.capital_toman / g0) if g0 else 0.0,
+        monthly_as_usd_now=(monthly / usd0) if usd0 else 0.0,
+        monthly_as_gram18_now=(monthly / g0) if g0 else 0.0,
+        capital_as_usd_end=(payload.capital_toman / usd[-1]) if usd[-1] else 0.0,
+        capital_as_gram18_end=(payload.capital_toman / g1) if g1 else 0.0,
+        monthly_as_usd_end=(monthly / usd[-1]) if usd[-1] else 0.0,
+        monthly_as_gram18_end=(monthly / g1) if g1 else 0.0,
+    )
+
     assumptions: dict[str, Any] = {
         "months": h,
         "total_cash_in": total_cash_in,
@@ -450,6 +832,8 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
         "usd_end": usd[-1],
         "gold_ounce_start": oz0,
         "gold_ounce_end": oz[-1],
+        "gram18_start": g0,
+        "gram18_end": g1,
         "models": {"gold": fc.gold.model_used, "usd": fc.usd.model_used},
     }
     return InvestCompareResponse(
@@ -458,4 +842,5 @@ def compare_methods(payload: InvestInput) -> InvestCompareResponse:
         recommendation=recommendation,
         assumptions=assumptions,
         suggested_monthly=suggest.suggested_monthly,
+        context=context,
     )

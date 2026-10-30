@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 
 DAYS_PER_MONTH = 30.44
+# امتیاز بانکی معمولاً روزانه است؛ برای شبیه‌سازی ماهانه × ۳۰ روز
+POINTS_DAYS_PER_MONTH = 30
 
 
 @dataclass(frozen=True)
@@ -96,3 +98,40 @@ def fund_value_from_cashflows(
         left = max(0, total_days - day)
         total += fund_compound(amt, annual_pct, left)
     return total
+
+
+def points_earned_in_month(deposit: float, toman_per_point: float) -> float:
+    """امتیاز یک ماه = (موجودی / نرخ روزانه) × ۳۰ روز."""
+    tpp = max(float(toman_per_point), 1e-9)
+    daily = max(float(deposit), 0.0) / tpp
+    return daily * POINTS_DAYS_PER_MONTH
+
+
+def compute_wait_months(
+    *,
+    capital: float,
+    monthly: float,
+    toman_per_point: float,
+    points_needed: float,
+    horizon: int,
+    to_bank: bool,
+) -> tuple[int, float, float]:
+    """
+    هر ماه امتیاز = (موجودی / toman_per_point) × ۳۰ روز، تا به points_needed برسد.
+    اگر to_bank: بعد از کسب امتیاز ماه، monthly به سپرده اضافه می‌شود.
+    Returns (wait_months, deposit_at_unlock, points_earned).
+    """
+    need = max(float(points_needed), 0.0)
+    h = max(int(horizon), 1)
+    if need <= 0:
+        return 1, max(float(capital), 0.0), 0.0
+
+    deposit = max(float(capital), 0.0)
+    points = 0.0
+    for m in range(1, h + 1):
+        points += points_earned_in_month(deposit, toman_per_point)
+        if points + 1e-9 >= need:
+            return m, deposit, points
+        if to_bank:
+            deposit += max(float(monthly), 0.0)
+    return h, deposit, points

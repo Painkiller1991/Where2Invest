@@ -84,10 +84,29 @@ export type InvestInput = {
   repay_months?: number
   fee_source?: 'from_loan' | 'cash'
   toman_per_point?: number
-  loan_per_point?: number
-  wait_months?: number
+  points_for_loan?: number
+  loan_for_points?: number
   model3_bank_annual_pct?: number
   repay_months_model3?: number | null
+}
+
+export type InvestMonthStep = {
+  month: number
+  label: string
+  events: string[]
+  cash_in: number
+  buy: number
+  installment: number
+  points: number
+  deposit: number
+  debt: number
+  asset_value: number
+  cash: number
+  wealth: number
+  price: number
+  units_bought: number
+  units_held: number
+  unit_label: string
 }
 
 export type InvestResult = {
@@ -103,6 +122,10 @@ export type InvestResult = {
   profit_pct: number
   notes: string
   valid: boolean
+  timeline?: InvestMonthStep[]
+  units_held?: number
+  unit_label?: string
+  end_price?: number
 }
 
 export type InvestRecommendation = {
@@ -114,12 +137,37 @@ export type InvestRecommendation = {
   message: string
 }
 
+export type InvestContext = {
+  horizon_months: number
+  usd_now: number
+  usd_end: number
+  usd_change_pct: number
+  ounce_now: number
+  ounce_end: number
+  ounce_change_pct: number
+  gram18_now: number
+  gram18_end: number
+  gram18_change_pct: number
+  capital_toman: number
+  monthly_budget_toman: number
+  total_cash_in: number
+  capital_as_usd_now: number
+  capital_as_gram18_now: number
+  monthly_as_usd_now: number
+  monthly_as_gram18_now: number
+  capital_as_usd_end: number
+  capital_as_gram18_end: number
+  monthly_as_usd_end: number
+  monthly_as_gram18_end: number
+}
+
 export type InvestCompareResponse = {
   results: InvestResult[]
   best_method: string
   recommendation: InvestRecommendation | null
   assumptions: Record<string, unknown>
   suggested_monthly: number
+  context?: InvestContext | null
 }
 
 export type InvestSuggestResponse = {

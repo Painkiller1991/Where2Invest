@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
   type DataStatus,
   type ForecastResponse,
   type InvestCompareResponse,
+  type InvestContext,
+  type InvestMonthStep,
+  type InvestResult,
 } from './api'
 import TradeChart from './components/TradeChart'
 
@@ -15,7 +18,328 @@ const STEPS = [
   'مقایسه سود',
 ]
 
+const TROY_OZ = 31.1034768
+
 type Flash = { kind: 'success' | 'error' | 'info'; text: string }
+
+function fmtMoney(n: number, digits = 0) {
+  if (!Number.isFinite(n)) return '—'
+  return n.toLocaleString('fa-IR', { maximumFractionDigits: digits })
+}
+
+function fmtPct(n: number) {
+  if (!Number.isFinite(n)) return '—'
+  const sign = n > 0 ? '+' : ''
+  return `${sign}${n.toFixed(1)}٪`
+}
+
+function gram18From(ounce: number, usd: number) {
+  if (!(ounce > 0) || !(usd > 0)) return 0
+  return ((ounce * usd) / TROY_OZ) * (18 / 24)
+}
+
+function buildLocalContext(
+  fc: ForecastResponse,
+  capital: number,
+  monthly: number,
+): InvestContext {
+  const usdNow = fc.usd.historical.at(-1)?.close ?? 0
+  const ozNow = fc.gold.historical.at(-1)?.close ?? 0
+  const usdEnd = fc.usd.forecast.at(-1)?.value ?? usdNow
+  const ozEnd = fc.gold.forecast.at(-1)?.value ?? ozNow
+  const g0 = gram18From(ozNow, usdNow)
+  const g1 = gram18From(ozEnd, usdEnd)
+  const h = fc.months
+  const pct = (a: number, b: number) => (a ? ((b - a) / a) * 100 : 0)
+  return {
+    horizon_months: h,
+    usd_now: usdNow,
+    usd_end: usdEnd,
+    usd_change_pct: pct(usdNow, usdEnd),
+    ounce_now: ozNow,
+    ounce_end: ozEnd,
+    ounce_change_pct: pct(ozNow, ozEnd),
+    gram18_now: g0,
+    gram18_end: g1,
+    gram18_change_pct: pct(g0, g1),
+    capital_toman: capital,
+    monthly_budget_toman: monthly,
+    total_cash_in: capital + monthly * h,
+    capital_as_usd_now: usdNow ? capital / usdNow : 0,
+    capital_as_gram18_now: g0 ? capital / g0 : 0,
+    monthly_as_usd_now: usdNow ? monthly / usdNow : 0,
+    monthly_as_gram18_now: g0 ? monthly / g0 : 0,
+    capital_as_usd_end: usdEnd ? capital / usdEnd : 0,
+    capital_as_gram18_end: g1 ? capital / g1 : 0,
+    monthly_as_usd_end: usdEnd ? monthly / usdEnd : 0,
+    monthly_as_gram18_end: g1 ? monthly / g1 : 0,
+  }
+}
+
+function parseGroupedNumber(raw: string): number {
+  const cleaned = raw
+    .replace(/[۰-۹]/g, (d) => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)))
+    .replace(/[,\u066C\u060C\s]/g, '')
+    .replace(/[٫]/g, '.')
+  if (cleaned === '' || cleaned === '-' || cleaned === '.') return 0
+  const n = Number(cleaned)
+  return Number.isFinite(n) ? n : 0
+}
+
+function formatGrouped(n: number, digits = 0): string {
+  if (!Number.isFinite(n)) return ''
+  return n.toLocaleString('en-US', {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: 0,
+  })
+}
+
+function MoneyInput({
+  value,
+  onChange,
+  digits = 0,
+}: {
+  value: number
+  onChange: (n: number) => void
+  digits?: number
+}) {
+  const [focused, setFocused] = useState(false)
+  const [text, setText] = useState(() => formatGrouped(value, digits))
+
+  useEffect(() => {
+    if (!focused) setText(formatGrouped(value, digits))
+  }, [value, digits, focused])
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      dir="ltr"
+      className="money-input"
+      value={focused ? text : formatGrouped(value, digits)}
+      onFocus={() => {
+        setFocused(true)
+        setText(formatGrouped(value, digits))
+      }}
+      onBlur={() => {
+        setFocused(false)
+        const n = parseGroupedNumber(text)
+        onChange(n)
+        setText(formatGrouped(n, digits))
+      }}
+      onChange={(e) => {
+        const raw = e.target.value
+        if (raw !== '' && !/^[\d۰-۹,.\u066C\u060C\s]*$/.test(raw)) return
+        setText(raw)
+        onChange(parseGroupedNumber(raw))
+      }}
+    />
+  )
+}
+
+function LoadingBlock({ text }: { text: string }) {
+  return (
+    <div className="loading-block" role="status" aria-live="polite" aria-busy="true">
+      <span className="spinner" aria-hidden="true" />
+      <div className="loading-copy">
+        <p className="loading-title">{text}</p>
+        <p className="loading-sub">لطفاً چند لحظه صبر کنید…</p>
+      </div>
+    </div>
+  )
+}
+
+function fmtUnits(n: number, label: string) {
+  if (!label || !Number.isFinite(n) || n <= 0) return '—'
+  const digits = label.includes('گرم') ? 4 : 2
+  return `${n.toLocaleString('fa-IR', { maximumFractionDigits: digits, minimumFractionDigits: digits })} ${label}`
+}
+
+function ScenarioTimeline({
+  steps,
+  result,
+}: {
+  steps: InvestMonthStep[]
+  result: InvestResult
+}) {
+  if (!steps.length) {
+    return <p className="muted">برای این سناریو جزئیات ماهانه ساخته نشد.</p>
+  }
+  const unitLabel = result.unit_label || steps.find((s) => s.unit_label)?.unit_label || ''
+  const showUnits = Boolean(unitLabel)
+  const unitsEnd = result.units_held ?? steps.at(-1)?.units_held ?? 0
+  const endPrice = result.end_price ?? steps.at(-1)?.price ?? 0
+  return (
+    <div className="timeline-panel">
+      {showUnits && (
+        <p className="timeline-summary">
+          جمع موجودی پایان افق: <strong>{fmtUnits(unitsEnd, unitLabel)}</strong>
+          {endPrice > 0 ? (
+            <>
+              {' '}
+              — قیمت پایان ≈ {fmtMoney(endPrice)} تومان
+              {' '}
+              — ارزش ریالی ≈ <strong>{fmtMoney(result.end_value)}</strong> تومان
+            </>
+          ) : (
+            <>
+              {' '}
+              — ارزش ریالی ≈ <strong>{fmtMoney(result.end_value)}</strong> تومان
+            </>
+          )}
+        </p>
+      )}
+      <div className="timeline-wrap">
+        <table className="timeline">
+          <thead>
+            <tr>
+              <th>ماه</th>
+              <th>رویدادها</th>
+              <th>ورود نقد</th>
+              <th>خرید (تومان)</th>
+              {showUnits && <th>خرید ({unitLabel})</th>}
+              {showUnits && <th>موجودی ({unitLabel})</th>}
+              <th>قسط</th>
+              <th>امتیاز</th>
+              <th>سپرده</th>
+              <th>بدهی</th>
+              <th>ارزش ریالی</th>
+              <th>ثروت</th>
+            </tr>
+          </thead>
+          <tbody>
+            {steps.map((s) => (
+              <tr key={s.month}>
+                <td>{s.label || `ماه ${s.month}`}</td>
+                <td className="timeline-events">
+                  {(s.events || []).map((e, i) => (
+                    <div key={i}>{e}</div>
+                  ))}
+                </td>
+                <td>{fmtMoney(s.cash_in)}</td>
+                <td>{fmtMoney(s.buy)}</td>
+                {showUnits && <td>{fmtUnits(s.units_bought, unitLabel)}</td>}
+                {showUnits && <td>{fmtUnits(s.units_held, unitLabel)}</td>}
+                <td>{s.installment ? fmtMoney(s.installment) : '—'}</td>
+                <td>{s.points ? s.points.toFixed(1) : '—'}</td>
+                <td>{s.deposit ? fmtMoney(s.deposit) : '—'}</td>
+                <td>{s.debt ? fmtMoney(s.debt) : '—'}</td>
+                <td>{fmtMoney(s.asset_value)}</td>
+                <td>{fmtMoney(s.wealth)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+function ResultsTable({
+  results,
+  bestMethod,
+  expanded,
+  onToggle,
+}: {
+  results: InvestResult[]
+  bestMethod: string
+  expanded: string | null
+  onToggle: (method: string) => void
+}) {
+  return (
+    <table className="results">
+      <thead>
+        <tr>
+          <th></th>
+          <th>روش / دارایی</th>
+          <th>قابل سرمایه‌گذاری</th>
+          <th>پایان</th>
+          <th>سود خالص</th>
+          <th>درصد</th>
+          <th>یادداشت</th>
+        </tr>
+      </thead>
+      <tbody>
+        {results.map((r) => {
+          const open = expanded === r.method
+          return (
+            <Fragment key={r.method}>
+              <tr
+                className={`${r.method === bestMethod ? 'best' : ''} ${r.valid === false ? 'invalid' : ''} ${open ? 'open' : ''}`}
+              >
+                <td>
+                  <button
+                    type="button"
+                    className="expand-btn"
+                    aria-expanded={open}
+                    onClick={() => onToggle(r.method)}
+                    title={open ? 'بستن جزئیات ماهانه' : 'باز کردن جزئیات ماهانه'}
+                  >
+                    {open ? '▾' : '▸'}
+                  </button>
+                </td>
+                <td>
+                  <button type="button" className="linkish" onClick={() => onToggle(r.method)}>
+                    {r.title}
+                  </button>
+                </td>
+                <td>{fmtMoney(r.investable)}</td>
+                <td>{fmtMoney(r.end_value)}</td>
+                <td>{fmtMoney(r.net_profit)}</td>
+                <td>{Number.isFinite(r.profit_pct) ? `${r.profit_pct.toFixed(2)}%` : '—'}</td>
+                <td>{r.notes}</td>
+              </tr>
+              {open && (
+                <tr className="timeline-row">
+                  <td colSpan={7}>
+                    <ScenarioTimeline steps={r.timeline || []} result={r} />
+                  </td>
+                </tr>
+              )}
+            </Fragment>
+          )
+        })}
+      </tbody>
+    </table>
+  )
+}
+
+function ContextFacts({ ctx }: { ctx: InvestContext }) {
+  return (
+    <div className="facts">
+      <p className="facts-title">جزئیات ثابت از روی پیش‌بینی و پول‌ها</p>
+      <ul className="facts-list">
+        <li>
+          افق پیش‌بینی: <strong>{ctx.horizon_months} ماه</strong>
+        </li>
+        <li>
+          دلار آزاد الان {fmtMoney(ctx.usd_now)} تومان → انتهای افق {fmtMoney(ctx.usd_end)} (
+          {fmtPct(ctx.usd_change_pct)})
+        </li>
+        <li>
+          گرم ۱۸ الان {fmtMoney(ctx.gram18_now)} تومان → انتهای افق {fmtMoney(ctx.gram18_end)} (
+          {fmtPct(ctx.gram18_change_pct)})
+        </li>
+        <li>
+          انس جهانی {fmtMoney(ctx.ounce_now, 1)} → {fmtMoney(ctx.ounce_end, 1)} دلار (
+          {fmtPct(ctx.ounce_change_pct)})
+        </li>
+        <li>
+          سرمایه {fmtMoney(ctx.capital_toman)} تومان ≈ الان {fmtMoney(ctx.capital_as_usd_now, 1)} دلار یا{' '}
+          {fmtMoney(ctx.capital_as_gram18_now, 2)} گرم طلا
+        </li>
+        <li>
+          بودجه ماهانه {fmtMoney(ctx.monthly_budget_toman)} تومان ≈ الان{' '}
+          {fmtMoney(ctx.monthly_as_usd_now, 1)} دلار یا {fmtMoney(ctx.monthly_as_gram18_now, 3)} گرم؛ با قیمت
+          انتهای افق ≈ {fmtMoney(ctx.monthly_as_usd_end, 1)} دلار / {fmtMoney(ctx.monthly_as_gram18_end, 3)} گرم
+        </li>
+        <li>
+          جمع پول ورودی تا افق (سرمایه + بودجه×ماه): <strong>{fmtMoney(ctx.total_cash_in)} تومان</strong>
+        </li>
+      </ul>
+    </div>
+  )
+}
 
 export default function App() {
   const [step, setStep] = useState(0)
@@ -57,10 +381,18 @@ export default function App() {
   const [repayMonths, setRepayMonths] = useState(12)
   const [feeSource, setFeeSource] = useState<'from_loan' | 'cash'>('from_loan')
   const [tomanPerPoint, setTomanPerPoint] = useState(100_000)
-  const [loanPerPoint, setLoanPerPoint] = useState(1_000_000)
-  const [waitMonths, setWaitMonths] = useState(3)
+  const [pointsForLoan, setPointsForLoan] = useState(100)
+  const [loanForPoints, setLoanForPoints] = useState(100_000_000)
   const [model3BankAnnual, setModel3BankAnnual] = useState(0)
   const [invest, setInvest] = useState<InvestCompareResponse | null>(null)
+  const [calcNote, setCalcNote] = useState<string | null>(null)
+  const [expandedMethod, setExpandedMethod] = useState<string | null>(null)
+  const resultsRef = useRef<HTMLElement | null>(null)
+
+  const localContext = useMemo(() => {
+    if (!forecast?.confirmed) return null
+    return buildLocalContext(forecast, capital, monthlyBudget)
+  }, [forecast, capital, monthlyBudget])
 
   const investPayload = () => ({
     capital_toman: capital,
@@ -79,8 +411,8 @@ export default function App() {
     repay_months: repayMonths,
     fee_source: feeSource,
     toman_per_point: tomanPerPoint,
-    loan_per_point: loanPerPoint,
-    wait_months: waitMonths,
+    points_for_loan: pointsForLoan,
+    loan_for_points: loanForPoints,
     model3_bank_annual_pct: model3BankAnnual,
   })
 
@@ -235,13 +567,21 @@ export default function App() {
       return
     }
     setLoading(true)
-    showFlash('info', 'در حال مقایسه روش‌های سرمایه‌گذاری...')
+    setCalcNote('در حال محاسبه مسیرها روی پیش‌بینی تاییدشده… صفحه را نبندید.')
+    showFlash('info', 'محاسبه شروع شد — جزئیات ثابت را همین‌جا ببینید.', 12000)
     try {
-      const res = await api.investCompare(investPayload())
+      const body = investPayload()
+      const res = await api.investCompare(body)
+      setExpandedMethod(res.best_method || res.results?.[0]?.method || null)
       setInvest(res)
       setStep(4)
-      showFlash('success', res.recommendation?.message || 'مقایسه انجام شد.')
+      setCalcNote(null)
+      showFlash('success', 'مقایسه آماده شد. توصیه و جدول پایین‌تر است.', 6000)
+      window.setTimeout(() => {
+        resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 80)
     } catch (e) {
+      setCalcNote(null)
       showFlash('error', 'مقایسه ناموفق: ' + String(e))
     } finally {
       setLoading(false)
@@ -262,12 +602,18 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="hero">
+      <header className={`hero ${step >= 3 ? 'hero-compact' : ''}`}>
         <div className="hero-bg" />
         <div className="hero-content">
           <p className="brand">Where2Invest</p>
-          <h1>کجا سرمایه‌گذاری کنم؟</h1>
-          <p className="tagline">دادهٔ انس و دلار آزاد، پیش‌بینی، و مقایسهٔ روش‌های سرمایه‌گذاری — لوکال</p>
+          {step < 3 ? (
+            <>
+              <h1>کجا سرمایه‌گذاری کنم؟</h1>
+              <p className="tagline">دادهٔ انس و دلار آزاد، پیش‌بینی، و مقایسهٔ روش‌های سرمایه‌گذاری — لوکال</p>
+            </>
+          ) : (
+            <h1 className="hero-mini">مدل‌ها و مقایسه سود</h1>
+          )}
         </div>
       </header>
 
@@ -293,7 +639,17 @@ export default function App() {
           </button>
         </div>
       ) : null}
-      {loading && flash?.kind !== 'info' ? <div className="banner info">در حال پردازش...</div> : null}
+      {loading ? (
+        <div className="sticky-status">
+          <LoadingBlock
+            text={
+              calcNote ||
+              (flash?.kind === 'info' ? flash.text : null) ||
+              'در حال پردازش…'
+            }
+          />
+        </div>
+      ) : null}
 
       {step === 0 && (
         <section className="panel">
@@ -449,16 +805,19 @@ export default function App() {
           <p className="muted">
             سه روش (فین‌تک، خرید مستقیم، بانک→وام) × طلا / دلار / صندوق. بودجه ماهانه برای مقایسه عادلانه مشترک است.
           </p>
+          {localContext && <ContextFacts ctx={localContext} />}
+          {loading && (
+            <LoadingBlock text={calcNote || 'در حال محاسبه و مقایسه مسیرهای سرمایه‌گذاری…'} />
+          )}
 
           <h3 className="subhead">مشترک</h3>
           <div className="row form-grid">
             <label>
               سرمایه اولیه (تومان)
-              <input
-                type="number"
+              <MoneyInput
                 value={capital}
-                onChange={(e) => {
-                  setCapital(Number(e.target.value))
+                onChange={(n) => {
+                  setCapital(n)
                   setBudgetConfirmed(false)
                 }}
               />
@@ -469,11 +828,10 @@ export default function App() {
             </label>
             <label>
               بودجه ماهانه (تومان)
-              <input
-                type="number"
+              <MoneyInput
                 value={monthlyBudget}
-                onChange={(e) => {
-                  setMonthlyBudget(Number(e.target.value))
+                onChange={(n) => {
+                  setMonthlyBudget(n)
                   setBudgetConfirmed(false)
                 }}
               />
@@ -522,11 +880,10 @@ export default function App() {
             <div className="row form-grid">
               <label>
                 مبلغ وام
-                <input
-                  type="number"
+                <MoneyInput
                   value={loanAmount}
-                  onChange={(e) => {
-                    setLoanAmount(Number(e.target.value))
+                  onChange={(n) => {
+                    setLoanAmount(n)
                     setBudgetConfirmed(false)
                   }}
                 />
@@ -597,38 +954,60 @@ export default function App() {
             </label>
           </div>
           {(enableBankToBank || enableBankToAsset) && (
-            <div className="row form-grid">
-              <label>
-                تومان به ازای هر امتیاز
-                <input type="number" value={tomanPerPoint} onChange={(e) => setTomanPerPoint(Number(e.target.value))} />
-              </label>
-              <label>
-                وام به ازای هر امتیاز
-                <input type="number" value={loanPerPoint} onChange={(e) => setLoanPerPoint(Number(e.target.value))} />
-              </label>
-              <label>
-                ماه انتظار تا وام
-                <input
-                  type="number"
-                  value={waitMonths}
-                  onChange={(e) => {
-                    setWaitMonths(Number(e.target.value))
-                    setBudgetConfirmed(false)
-                  }}
-                />
-              </label>
-              <label>
-                سود وام بانکی مدل۳ (%) — ۰ = بدون قسط
-                <input
-                  type="number"
-                  value={model3BankAnnual}
-                  onChange={(e) => {
-                    setModel3BankAnnual(Number(e.target.value))
-                    setBudgetConfirmed(false)
-                  }}
-                />
-              </label>
-            </div>
+            <>
+              <div className="row form-grid">
+                <label>
+                  تومان موجودی = ۱ امتیاز / روز
+                  <MoneyInput
+                    value={tomanPerPoint}
+                    onChange={(n) => {
+                      setTomanPerPoint(n)
+                      setBudgetConfirmed(false)
+                    }}
+                  />
+                </label>
+                <label>
+                  چند امتیاز برای وام
+                  <MoneyInput
+                    value={pointsForLoan}
+                    onChange={(n) => {
+                      setPointsForLoan(n)
+                      setBudgetConfirmed(false)
+                    }}
+                  />
+                </label>
+                <label>
+                  با آن امتیاز چقدر وام (تومان)
+                  <MoneyInput
+                    value={loanForPoints}
+                    onChange={(n) => {
+                      setLoanForPoints(n)
+                      setBudgetConfirmed(false)
+                    }}
+                  />
+                </label>
+                <label>
+                  سود وام بانکی مدل۳ (%) — ۰ = بدون قسط
+                  <input
+                    type="number"
+                    value={model3BankAnnual}
+                    onChange={(e) => {
+                      setModel3BankAnnual(Number(e.target.value))
+                      setBudgetConfirmed(false)
+                    }}
+                  />
+                </label>
+              </div>
+              <p className="muted">
+                امتیاز روزانه = موجودی ÷ نرخ بالا؛ هر ماه ≈ همان × ۳۰ روز، تا به امتیاز لازم برسد
+                {pointsForLoan > 0
+                  ? ` (هر امتیاز ≈ ${(loanForPoints / pointsForLoan).toLocaleString('fa-IR')} تومان وام).`
+                  : '.'}
+                {tomanPerPoint > 0 && capital > 0 && pointsForLoan > 0
+                  ? ` با سرمایه فعلی ≈ ${Math.floor(capital / tomanPerPoint).toLocaleString('fa-IR')} امتیاز/روز (~${Math.floor((capital / tomanPerPoint) * 30).toLocaleString('fa-IR')} /ماه)؛ برای ${pointsForLoan.toLocaleString('fa-IR')} امتیاز مسیر ۳ب حدود ${Math.ceil(pointsForLoan / ((capital / tomanPerPoint) * 30)).toLocaleString('fa-IR')} ماه.`
+                  : ''}
+              </p>
+            </>
           )}
 
           <div className="row">
@@ -639,42 +1018,38 @@ export default function App() {
         </section>
       )}
 
-      {step === 4 && invest && (
-        <section className="panel">
+      {step === 4 && (
+        <section className="panel" ref={resultsRef}>
           <h2>مرحله ۵ — مقایسه سود</h2>
-          {invest.recommendation && (
-            <div className="recommend">
-              <p className="recommend-label">توصیه</p>
-              <p className="recommend-msg">{invest.recommendation.message}</p>
-            </div>
+          {loading && (
+            <LoadingBlock text={calcNote || 'در حال آماده‌سازی نتایج…'} />
           )}
-          <table className="results">
-            <thead>
-              <tr>
-                <th>روش / دارایی</th>
-                <th>قابل سرمایه‌گذاری</th>
-                <th>پایان</th>
-                <th>سود خالص</th>
-                <th>درصد</th>
-                <th>یادداشت</th>
-              </tr>
-            </thead>
-            <tbody>
-              {invest.results.map((r) => (
-                <tr
-                  key={r.method}
-                  className={`${r.method === invest.best_method ? 'best' : ''} ${r.valid ? '' : 'invalid'}`}
-                >
-                  <td>{r.title}</td>
-                  <td>{r.investable.toLocaleString('fa-IR')}</td>
-                  <td>{r.end_value.toLocaleString('fa-IR')}</td>
-                  <td>{r.net_profit.toLocaleString('fa-IR')}</td>
-                  <td>{r.profit_pct.toFixed(2)}%</td>
-                  <td>{r.notes}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {!invest && !loading && (
+            <p className="muted">هنوز نتیجه‌ای نیست. از مرحله ۴ محاسبه را بزنید.</p>
+          )}
+          {invest && (
+            <>
+              {(invest.context || localContext) && (
+                <ContextFacts ctx={invest.context || localContext!} />
+              )}
+              {invest.recommendation && (
+                <div className="recommend">
+                  <p className="recommend-label">توصیه</p>
+                  <p className="recommend-msg">{invest.recommendation.message}</p>
+                </div>
+              )}
+              {!invest.recommendation && (
+                <p className="muted">هیچ ردیف معتبری برای توصیه باقی نماند؛ جدول را برای جزئیات ببینید.</p>
+              )}
+              <p className="muted">روی ▸ یا عنوان هر سناریو بزن تا ببینی هر ماه چه اتفاقی می‌افتد.</p>
+              <ResultsTable
+                results={invest.results || []}
+                bestMethod={invest.best_method}
+                expanded={expandedMethod}
+                onToggle={(method) => setExpandedMethod((cur) => (cur === method ? null : method))}
+              />
+            </>
+          )}
           <div className="row">
             <button type="button" className="ghost" onClick={() => setStep(3)}>
               تغییر ورودی سرمایه‌گذاری
