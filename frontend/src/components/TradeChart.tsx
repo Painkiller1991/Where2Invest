@@ -1,8 +1,56 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { dispose, getSupportedOverlays, init, type Chart, type KLineData } from 'klinecharts'
-import type { Candle, ForecastPoint } from '../api'
+import {
+  dispose,
+  getSupportedOverlays,
+  init,
+  registerOverlay,
+  type Chart,
+  type KLineData,
+} from 'klinecharts'
+import { api, type Candle, type ForecastPoint } from '../api'
+import { normalizeChartTf, type ChartTf } from '../persist'
 
-type Tf = '1D' | '1W' | '1M'
+type Tf = ChartTf
+
+export type DecisionOverlay = {
+  label: string
+  /** unix seconds */
+  decisionTime: number
+  decisionPrice: number
+  /** مسیر پیش‌بینی ذخیره‌شده (unix seconds) */
+  points: { time: number; value: number }[]
+  color?: string
+}
+
+const DECISION_COLOR = '#7c4dff'
+const REAL_LEGEND = '#26a69a'
+
+let decisionOverlayRegistered = false
+function ensureDecisionPathOverlay() {
+  if (decisionOverlayRegistered) return
+  decisionOverlayRegistered = true
+  try {
+    registerOverlay({
+      name: 'decisionPath',
+      totalStep: 1,
+      needDefaultPointFigure: false,
+      needDefaultXAxisFigure: false,
+      needDefaultYAxisFigure: false,
+      createPointFigures: ({ coordinates }) => {
+        if (!coordinates || coordinates.length < 2) return []
+        return [
+          {
+            type: 'line',
+            attrs: { coordinates },
+            styles: { style: 'solid', size: 2.5 },
+          },
+        ]
+      },
+    })
+  } catch {
+    /* already registered / unsupported */
+  }
+}
 
 const TOOLS: { name: string; label: string }[] = [
   { name: 'segment', label: '/' },
@@ -28,6 +76,11 @@ type Props = {
   unit: string
   candles: Candle[]
   forecast?: ForecastPoint[]
+  /** مسیر تصمیم خرید ذخیره‌شده روی چارت واقعی */
+  decisionOverlay?: DecisionOverlay | null
+  /** تایم‌فریم مشترک از دیتابیس؛ اگر نباشد خودش لود/ذخیره می‌کند */
+  timeframe?: ChartTf
+  onTimeframeChange?: (tf: ChartTf) => void
   height?: number
 }
 
@@ -164,6 +217,9 @@ export default function TradeChart({
   unit,
   candles,
   forecast,
+  decisionOverlay = null,
+  timeframe,
+  onTimeframeChange,
   height = 540,
 }: Props) {
   const rootRef = useRef<HTMLElement | null>(null)
@@ -171,7 +227,18 @@ export default function TradeChart({
   const chartRef = useRef<Chart | null>(null)
   const dataRef = useRef<KLineData[]>([])
   const drawIdsRef = useRef<string[]>([])
-  const [tf, setTf] = useState<Tf>('1D')
+  const [tf, setTfState] = useState<Tf>(() => normalizeChartTf(timeframe, '1W'))
+  const setTf = (t: Tf) => {
+    setTfState(t)
+    onTimeframeChange?.(t)
+    if (!onTimeframeChange) {
+      void api.userSaveChartTf(t).catch(() => undefined)
+    }
+  }
+
+  useEffect(() => {
+    if (timeframe) setTfState(normalizeChartTf(timeframe, '1W'))
+  }, [timeframe])
   const [activeTool, setActiveTool] = useState<string | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [drawCount, setDrawCount] = useState(0)
@@ -200,6 +267,7 @@ export default function TradeChart({
 
   useEffect(() => {
     if (!containerRef.current) return
+    ensureDecisionPathOverlay()
     const chart = init(containerRef.current, {
       timezone: 'Asia/Tehran',
       styles: { ...LIGHT_STYLES, ...axisFontStyles(fontSize) } as never,
@@ -248,6 +316,49 @@ export default function TradeChart({
       }
     }
 
+    if (decisionOverlay && decisionOverlay.points.length > 0) {
+      const color = decisionOverlay.color || DECISION_COLOR
+      const path = [
+        { timestamp: decisionOverlay.decisionTime * 1000, value: decisionOverlay.decisionPrice },
+        ...decisionOverlay.points.map((p) => ({ timestamp: p.time * 1000, value: p.value })),
+      ]
+      try {
+        chart.createOverlay({
+          name: 'decisionPath',
+          id: 'decision-path',
+          points: path,
+          lock: true,
+          styles: { line: { color, size: 2.5 } },
+        })
+      } catch {
+        // fallback: تکه‌خطوط
+        for (let i = 0; i < path.length - 1; i++) {
+          try {
+            chart.createOverlay({
+              name: 'segment',
+              id: `decision-seg-${i}`,
+              points: [path[i], path[i + 1]],
+              lock: true,
+              styles: { line: { color, size: 2 } },
+            })
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      try {
+        chart.createOverlay({
+          name: 'verticalStraightLine',
+          id: 'decision-split',
+          points: [{ timestamp: decisionOverlay.decisionTime * 1000, value: decisionOverlay.decisionPrice }],
+          styles: { line: { color, size: 1, style: 'dashed' } },
+          lock: true,
+        })
+      } catch {
+        /* ignore */
+      }
+    }
+
     const onResize = () => chart.resize()
     window.addEventListener('resize', onResize)
     return () => {
@@ -257,7 +368,7 @@ export default function TradeChart({
     }
     // fontSize applied separately so drawings are not wiped on font change
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ticker, unit, baseDaily, tf, forecast, candles])
+  }, [ticker, unit, baseDaily, tf, forecast, candles, decisionOverlay])
 
   useEffect(() => {
     const chart = chartRef.current
@@ -390,6 +501,7 @@ export default function TradeChart({
 
   const changeUp = ohlc ? ohlc.c >= ohlc.o : true
   const hasForecast = Boolean(forecast?.length && candles.length)
+  const hasDecision = Boolean(decisionOverlay?.points?.length)
 
   const canvasHeight = fullscreen ? 'calc(100vh - 56px)' : height
 
@@ -436,10 +548,23 @@ export default function TradeChart({
             <span className="pro-unit">{unit}</span>
           </div>
         ) : null}
-        {hasForecast ? (
-          <div className="pro-legend">
-            <span className="dot real" /> Real
-            <span className="dot pred" /> Forecast
+        {hasForecast || hasDecision ? (
+          <div className="pro-legend" dir="rtl">
+            <span className="dot real" style={{ background: REAL_LEGEND }} /> واقعی
+            {hasForecast ? (
+              <>
+                <span className="dot pred" /> پیش‌بینی جاری
+              </>
+            ) : null}
+            {hasDecision ? (
+              <>
+                <span
+                  className="dot decision"
+                  style={{ background: decisionOverlay?.color || DECISION_COLOR }}
+                />
+                تصمیم: {decisionOverlay?.label}
+              </>
+            ) : null}
           </div>
         ) : null}
         <div className="pro-view-controls">

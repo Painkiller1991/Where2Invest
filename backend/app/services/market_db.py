@@ -83,6 +83,16 @@ class MarketDB:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_decisions_created
+                    ON decisions(created_at DESC);
                 """
             )
 

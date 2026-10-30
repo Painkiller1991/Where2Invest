@@ -47,7 +47,7 @@ class ForecastRequest(BaseModel):
     gold_sentiment: float = Field(ge=-10, le=10)
     usd_sentiment: float = Field(ge=-10, le=10)
     months: int = Field(ge=1, le=36)
-    model: Literal["hybrid", "auto", "lightgbm", "prophet", "both", "drift"] = "hybrid"
+    model: Literal["hybrid", "auto", "lightgbm", "prophet", "both", "drift"] = "both"
 
 
 class ForecastPoint(BaseModel):
@@ -195,3 +195,42 @@ class InvestCompareResponse(BaseModel):
     assumptions: dict[str, Any]
     suggested_monthly: float = 0.0
     context: InvestContext | None = None
+
+
+class UserStateResponse(BaseModel):
+    prefs: dict[str, Any]
+    has_prefs: bool = False
+    chart_tf: Literal["1D", "1W", "1M"] = "1W"
+    active_decision_id: str | None = None
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class UserPrefsUpdate(BaseModel):
+    prefs: dict[str, Any]
+
+
+class ChartTfUpdate(BaseModel):
+    chart_tf: Literal["1D", "1W", "1M"]
+
+
+class ActiveDecisionUpdate(BaseModel):
+    active_decision_id: str | None = None
+
+
+class DecisionUpsert(BaseModel):
+    decision: dict[str, Any]
+
+
+class DecisionMetaUpdate(BaseModel):
+    title: str | None = None
+    note: str | None = None
+
+
+class UserImportBundle(BaseModel):
+    """Migrate browser localStorage → SQLite (once)."""
+
+    prefs: dict[str, Any] | None = None
+    chart_tf: Literal["1D", "1W", "1M"] | None = None
+    active_decision_id: str | None = None
+    decisions: list[dict[str, Any]] | None = None
+    only_if_empty: bool = True

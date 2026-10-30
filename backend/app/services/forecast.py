@@ -38,7 +38,7 @@ def run_forecast(
     gold_sentiment: float,
     usd_sentiment: float,
     months: int,
-    model: str = "hybrid",
+    model: str = "both",
 ) -> ForecastResponse:
     global _last_forecast, _confirmed
     if not data_gate.ready:

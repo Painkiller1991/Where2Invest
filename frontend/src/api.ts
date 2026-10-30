@@ -213,4 +213,54 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  userState: () => req<UserStateResponse>('/api/user/state'),
+  userSavePrefs: (prefs: Record<string, unknown>) =>
+    req<UserStateResponse>('/api/user/prefs', {
+      method: 'PUT',
+      body: JSON.stringify({ prefs }),
+    }),
+  userSaveChartTf: (chart_tf: '1D' | '1W' | '1M') =>
+    req<UserStateResponse>('/api/user/chart-tf', {
+      method: 'PUT',
+      body: JSON.stringify({ chart_tf }),
+    }),
+  userSetActiveDecision: (active_decision_id: string | null) =>
+    req<UserStateResponse>('/api/user/active-decision', {
+      method: 'PUT',
+      body: JSON.stringify({ active_decision_id }),
+    }),
+  userUpsertDecision: (decision: Record<string, unknown>) =>
+    req<UserStateResponse>('/api/user/decisions', {
+      method: 'POST',
+      body: JSON.stringify({ decision }),
+    }),
+  userPatchDecision: (id: string, patch: { title?: string; note?: string }) =>
+    req<UserStateResponse>(`/api/user/decisions/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  userDeleteDecision: (id: string) =>
+    req<UserStateResponse>(`/api/user/decisions/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  userImport: (body: {
+    prefs?: Record<string, unknown> | null
+    chart_tf?: '1D' | '1W' | '1M' | null
+    active_decision_id?: string | null
+    decisions?: unknown[] | null
+    only_if_empty?: boolean
+  }) =>
+    req<UserStateResponse>('/api/user/import', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+}
+
+export type UserStateResponse = {
+  prefs: Record<string, unknown>
+  has_prefs: boolean
+  chart_tf: '1D' | '1W' | '1M'
+  active_decision_id: string | null
+  decisions: Record<string, unknown>[]
 }

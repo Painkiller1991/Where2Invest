@@ -471,12 +471,14 @@ def _sim_bank(
                     events.append(f"≈ {_fmt_units(um, asset)} @ {book.price(m):,.0f}")
                 deposit = 0.0
                 repay_n = max(1, int(repay_months_model3) if repay_months_model3 else 12)
-                use_inst = model3_bank_annual_pct > 0 and loan > 0
-                if use_inst:
-                    sched = declining_balance_schedule(loan, model3_bank_annual_pct, repay_n)
-                    events.append(f"شروع اقساط {repay_n} ماهه (قسط اول ~{max_monthly_payment(sched):,.0f})")
-                else:
-                    events.append("وام بدون بهره؛ اصل در پایان افق می‌ماند")
+                if loan > 0:
+                    # بهره ۰ = فقط اصل مساوی ماهانه؛ همچنان قسط برای بودجه ماهانه لازم است
+                    sched = declining_balance_schedule(
+                        loan, max(0.0, float(model3_bank_annual_pct)), repay_n
+                    )
+                    events.append(
+                        f"شروع اقساط {repay_n} ماهه (قسط اول ~{max_monthly_payment(sched):,.0f})"
+                    )
                 if monthly > 1e-6:
                     u_m = book.buy(monthly, m)
                     um += u_m
@@ -521,10 +523,6 @@ def _sim_bank(
                     events.append(f"خرید ماهانه {monthly:,.0f}")
                     if ul and um > 0:
                         events.append(f"≈ {_fmt_units(um, asset)}")
-                if not use_inst and loan > 0:
-                    debt = loan
-                    events.append(f"بدهی بدون بهره باقی‌مانده {debt:,.0f}")
-
         timeline.append(
             _step(
                 month=m,
@@ -596,9 +594,8 @@ def _sim_bank(
             rem_debt = 0.0
             investable = capital
     else:
-        use_inst = bool(sched)
         max_pay3 = max_monthly_payment(sched) if sched else 0.0
-        if use_inst:
+        if sched:
             if max_pay3 > monthly + 1e-6:
                 valid = False
                 notes.append(f"قسط اول قرارداد ~{max_pay3:,.0f} بیش از بودجه ماهانه")
@@ -609,25 +606,31 @@ def _sim_bank(
             rem_debt = debt
         else:
             rem_debt = loan
-            notes.append("بدون بهره وام؛ تسویه اصل در پایان افق")
         end_value = book.value(h)
 
     return end_value, rem_debt, investable, valid, notes, timeline, book.units, book.price(h)
 
 
 def suggest_monthly_budget(payload: InvestInput) -> InvestSuggestResponse:
+    """ماکس قسط اول بین شیوه‌های وامِ فعال (فین‌تک / بانک). مستقیم قسط ندارد."""
     details: dict[str, float] = {}
     if payload.enable_fintech and payload.loan_amount > 0 and payload.repay_months > 0:
         sched = declining_balance_schedule(
-            payload.loan_amount, payload.bank_annual_pct, payload.repay_months
+            payload.loan_amount,
+            max(0.0, float(payload.bank_annual_pct)),
+            payload.repay_months,
         )
-        details["fintech"] = max_monthly_payment(sched)
-    if (payload.enable_bank_to_bank or payload.enable_bank_to_asset) and payload.model3_bank_annual_pct > 0:
+        if sched:
+            details["fintech"] = max_monthly_payment(sched)
+    if payload.enable_bank_to_bank or payload.enable_bank_to_asset:
         loan_a = float(payload.loan_for_points)
         n = max(1, int(payload.repay_months_model3) if payload.repay_months_model3 else 12)
         if loan_a > 0:
-            sched3 = declining_balance_schedule(loan_a, payload.model3_bank_annual_pct, n)
-            details["bank_loan"] = max_monthly_payment(sched3)
+            sched3 = declining_balance_schedule(
+                loan_a, max(0.0, float(payload.model3_bank_annual_pct)), n
+            )
+            if sched3:
+                details["bank_loan"] = max_monthly_payment(sched3)
     suggested = max(details.values()) if details else 0.0
     return InvestSuggestResponse(suggested_monthly=suggested, details=details)
 

@@ -10,7 +10,26 @@ import {
   type InvestMonthStep,
   type InvestResult,
 } from './api'
-import TradeChart from './components/TradeChart'
+import DecisionsPage from './components/DecisionsPage'
+import TradeChart, { type DecisionOverlay } from './components/TradeChart'
+import {
+  buildDecisionFromForecast,
+  investSummary,
+  normalizeDecisions,
+  type DecisionSnapshot,
+} from './decisions'
+import { buildGram18Candles, buildGram18Series, gram18From } from './gram18'
+import {
+  clearLegacyBrowserKeys,
+  FORM_DEFAULTS,
+  markLegacyMigrated,
+  normalizeChartTf,
+  normalizeFormPrefs,
+  peekLegacyBrowserBundle,
+  wasLegacyMigrated,
+  type ChartTf,
+  type FormPrefs,
+} from './persist'
 
 const STEPS = [
   'آپدیت داده و چارت',
@@ -18,8 +37,6 @@ const STEPS = [
   'مدل‌های سرمایه‌گذاری',
   'مقایسه سود',
 ]
-
-const TROY_OZ = 31.1034768
 
 type Flash = { kind: 'success' | 'error' | 'info'; text: string }
 
@@ -91,6 +108,7 @@ function RangeField({
         <span>{label}</span>
         <strong dir="ltr">{display ?? String(value)}</strong>
       </div>
+      {/* RTL: چپ = max (+۱۰ / ۳۶)، راست = min (−۱۰ / ۱) — هم‌تراز با اسلایدر */}
       <input
         type="range"
         min={min}
@@ -99,9 +117,9 @@ function RangeField({
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
       />
-      <div className="range-ends" dir="ltr">
-        <span>{min}</span>
+      <div className="range-ends">
         <span>{max}</span>
+        <span>{min}</span>
       </div>
     </label>
   )
@@ -140,9 +158,19 @@ function ForecastStatsCard({
   )
 }
 
-function gram18From(ounce: number, usd: number) {
-  if (!(ounce > 0) || !(usd > 0)) return 0
-  return ((ounce * usd) / TROY_OZ) * (18 / 24)
+function toDecisionOverlay(
+  snap: DecisionSnapshot | null,
+  which: 'gold' | 'usd' | 'gram18',
+): DecisionOverlay | null {
+  if (!snap) return null
+  const s = snap[which]
+  if (!s?.forecast?.length || !(s.last_time > 0) || !(s.last_close > 0)) return null
+  return {
+    label: snap.title,
+    decisionTime: s.last_time,
+    decisionPrice: s.last_close,
+    points: s.forecast.map((p) => ({ time: p.time, value: p.value })),
+  }
 }
 
 function buildLocalContext(
@@ -449,8 +477,18 @@ function ContextFacts({ ctx }: { ctx: InvestContext }) {
 }
 
 export default function App() {
+  const prefs0 = FORM_DEFAULTS
+  const prefsHydrated = useRef(false)
+  const prefsSaveTimer = useRef<number | null>(null)
+  const decisionPatchTimer = useRef<number | null>(null)
+
+  const onChartTfChange = useCallback((t: ChartTf) => {
+    setChartTf(t)
+    void api.userSaveChartTf(t).catch(() => undefined)
+  }, [])
+
   const [step, setStep] = useState(0)
-  const [startDate, setStartDate] = useState('2018-01-01')
+  const [startDate, setStartDate] = useState(prefs0.startDate)
   const [loading, setLoading] = useState(false)
   const [flash, setFlash] = useState<Flash | null>(null)
   const flashTimer = useRef<number | null>(null)
@@ -466,43 +504,136 @@ export default function App() {
     }
   }, [])
 
-  const [goldSentiment, setGoldSentiment] = useState(0)
-  const [usdSentiment, setUsdSentiment] = useState(0)
-  const [months, setMonths] = useState(3)
-  const [forecastModel, setForecastModel] = useState<
-    'hybrid' | 'auto' | 'lightgbm' | 'prophet' | 'both' | 'drift'
-  >('hybrid')
+  const [goldSentiment, setGoldSentiment] = useState(prefs0.goldSentiment)
+  const [usdSentiment, setUsdSentiment] = useState(prefs0.usdSentiment)
+  const [months, setMonths] = useState(prefs0.months)
+  const [forecastModel, setForecastModel] = useState<FormPrefs['forecastModel']>(prefs0.forecastModel)
   const [forecast, setForecast] = useState<ForecastResponse | null>(null)
 
-  const [capital, setCapital] = useState(100_000_000)
-  const [monthlyBudget, setMonthlyBudget] = useState(0)
+  const [capital, setCapital] = useState(prefs0.capital)
+  const [monthlyBudget, setMonthlyBudget] = useState(prefs0.monthlyBudget)
   const [budgetConfirmed, setBudgetConfirmed] = useState(false)
-  const [fundAnnual, setFundAnnual] = useState(20)
-  const [enableGold, setEnableGold] = useState(true)
-  const [enableUsd, setEnableUsd] = useState(true)
-  const [enableFund, setEnableFund] = useState(true)
-  const [enableFintech, setEnableFintech] = useState(true)
-  const [enableDirect, setEnableDirect] = useState(true)
-  const [enableBankToBank, setEnableBankToBank] = useState(true)
-  const [enableBankToAsset, setEnableBankToAsset] = useState(true)
-  const [loanAmount, setLoanAmount] = useState(100_000_000)
-  const [companyFeePct, setCompanyFeePct] = useState(5)
-  const [bankAnnualPct, setBankAnnualPct] = useState(22)
-  const [repayMonths, setRepayMonths] = useState(12)
-  const [feeSource, setFeeSource] = useState<'from_loan' | 'cash'>('from_loan')
-  const [tomanPerPoint, setTomanPerPoint] = useState(100_000)
-  const [pointsForLoan, setPointsForLoan] = useState(100)
-  const [loanForPoints, setLoanForPoints] = useState(100_000_000)
-  const [model3BankAnnual, setModel3BankAnnual] = useState(0)
+  const [fundAnnual, setFundAnnual] = useState(prefs0.fundAnnual)
+  const [enableGold, setEnableGold] = useState(prefs0.enableGold)
+  const [enableUsd, setEnableUsd] = useState(prefs0.enableUsd)
+  const [enableFund, setEnableFund] = useState(prefs0.enableFund)
+  const [enableFintech, setEnableFintech] = useState(prefs0.enableFintech)
+  const [enableDirect, setEnableDirect] = useState(prefs0.enableDirect)
+  const [enableBankToBank, setEnableBankToBank] = useState(prefs0.enableBankToBank)
+  const [enableBankToAsset, setEnableBankToAsset] = useState(prefs0.enableBankToAsset)
+  const [loanAmount, setLoanAmount] = useState(prefs0.loanAmount)
+  const [companyFeePct, setCompanyFeePct] = useState(prefs0.companyFeePct)
+  const [bankAnnualPct, setBankAnnualPct] = useState(prefs0.bankAnnualPct)
+  const [repayMonths, setRepayMonths] = useState(prefs0.repayMonths)
+  const [feeSource, setFeeSource] = useState<FormPrefs['feeSource']>(prefs0.feeSource)
+  const [tomanPerPoint, setTomanPerPoint] = useState(prefs0.tomanPerPoint)
+  const [pointsForLoan, setPointsForLoan] = useState(prefs0.pointsForLoan)
+  const [loanForPoints, setLoanForPoints] = useState(prefs0.loanForPoints)
+  const [model3BankAnnual, setModel3BankAnnual] = useState(prefs0.model3BankAnnual)
   const [invest, setInvest] = useState<InvestCompareResponse | null>(null)
   const [calcNote, setCalcNote] = useState<string | null>(null)
   const [expandedMethod, setExpandedMethod] = useState<string | null>(null)
   const resultsRef = useRef<HTMLElement | null>(null)
+  const [page, setPage] = useState<'flow' | 'decisions'>('flow')
+  const [decisions, setDecisions] = useState<DecisionSnapshot[]>([])
+  const [activeDecisionId, setActiveDecisionId] = useState<string | null>(null)
+  const [chartTf, setChartTf] = useState<ChartTf>('1W')
+
+  const applyPrefs = useCallback((p: FormPrefs) => {
+    setStartDate(p.startDate)
+    setGoldSentiment(p.goldSentiment)
+    setUsdSentiment(p.usdSentiment)
+    setMonths(p.months)
+    setForecastModel(p.forecastModel)
+    setCapital(p.capital)
+    setMonthlyBudget(p.monthlyBudget)
+    setFundAnnual(p.fundAnnual)
+    setEnableGold(p.enableGold)
+    setEnableUsd(p.enableUsd)
+    setEnableFund(p.enableFund)
+    setEnableFintech(p.enableFintech)
+    setEnableDirect(p.enableDirect)
+    setEnableBankToBank(p.enableBankToBank)
+    setEnableBankToAsset(p.enableBankToAsset)
+    setLoanAmount(p.loanAmount)
+    setCompanyFeePct(p.companyFeePct)
+    setBankAnnualPct(p.bankAnnualPct)
+    setRepayMonths(p.repayMonths)
+    setFeeSource(p.feeSource)
+    setTomanPerPoint(p.tomanPerPoint)
+    setPointsForLoan(p.pointsForLoan)
+    setLoanForPoints(p.loanForPoints)
+    setModel3BankAnnual(p.model3BankAnnual)
+  }, [])
+
+  const applyUserState = useCallback(
+    (state: {
+      prefs: Record<string, unknown>
+      chart_tf: ChartTf
+      active_decision_id: string | null
+      decisions: unknown[]
+    }) => {
+      applyPrefs(normalizeFormPrefs(state.prefs))
+      setChartTf(normalizeChartTf(state.chart_tf))
+      setDecisions(normalizeDecisions(state.decisions))
+      setActiveDecisionId(state.active_decision_id)
+    },
+    [applyPrefs],
+  )
 
   const localContext = useMemo(() => {
     if (!forecast?.confirmed) return null
     return buildLocalContext(forecast, capital, monthlyBudget)
   }, [forecast, capital, monthlyBudget])
+
+  const gram18Forecast = useMemo(
+    () => (forecast ? buildGram18Series(forecast.gold, forecast.usd) : null),
+    [forecast],
+  )
+
+  const activeDecision = useMemo(
+    () => decisions.find((d) => d.id === activeDecisionId) || null,
+    [activeDecisionId, decisions],
+  )
+
+  const gram18LiveCandles = useMemo(() => {
+    if (!status?.gold?.candles?.length || !status?.usd?.candles?.length) return []
+    return buildGram18Candles(status.gold.candles, status.usd.candles)
+  }, [status])
+
+  const setActiveDecision = async (id: string | null) => {
+    setActiveDecisionId(id)
+    try {
+      const state = await api.userSetActiveDecision(id)
+      setDecisions(normalizeDecisions(state.decisions))
+      setActiveDecisionId(state.active_decision_id)
+    } catch (e) {
+      showFlash('error', 'ذخیره تصمیم فعال ناموفق: ' + String(e))
+    }
+  }
+
+  const saveBuyDecision = async (withInvest: boolean) => {
+    if (!forecast) {
+      showFlash('error', 'اول پیش‌بینی را اجرا کنید.')
+      return
+    }
+    const snap = buildDecisionFromForecast(forecast, {
+      forecastModel,
+      invest: withInvest && invest ? investSummary(invest, capital, monthlyBudget) : undefined,
+    })
+    try {
+      const state = await api.userUpsertDecision(snap as unknown as Record<string, unknown>)
+      setDecisions(normalizeDecisions(state.decisions))
+      await setActiveDecision(snap.id)
+      showFlash(
+        'success',
+        `تصمیم خرید در دیتابیس ذخیره شد: ${snap.title}`,
+        7000,
+      )
+    } catch (e) {
+      showFlash('error', 'ذخیره تصمیم ناموفق: ' + String(e))
+    }
+  }
 
   const investPayload = () => ({
     capital_toman: capital,
@@ -535,15 +666,51 @@ export default function App() {
   useEffect(() => {
     ;(async () => {
       try {
+        setLoading(true)
+        setCalcNote('در حال بارگذاری تنظیمات از دیتابیس...')
+        let state = await api.userState()
+
+        // یک‌بار: اگر در مرورگر چیزی مانده، به SQLite منتقل کن
+        if (!wasLegacyMigrated()) {
+          const legacy = peekLegacyBrowserBundle()
+          const hasLegacy =
+            Boolean(legacy.prefs) ||
+            Boolean(legacy.chart_tf) ||
+            Boolean(legacy.decisions?.length) ||
+            Boolean(legacy.active_decision_id)
+          if (hasLegacy && (!state.has_prefs || !state.decisions?.length)) {
+            state = await api.userImport({
+              prefs: legacy.prefs,
+              chart_tf: legacy.chart_tf,
+              active_decision_id: legacy.active_decision_id,
+              decisions: legacy.decisions,
+              only_if_empty: true,
+            })
+            clearLegacyBrowserKeys()
+            markLegacyMigrated()
+            showFlash('info', 'تنظیمات و تصمیم‌های قبلی از مرورگر به دیتابیس منتقل شد.', 6000)
+          } else {
+            markLegacyMigrated()
+            clearLegacyBrowserKeys()
+          }
+        }
+
+        applyUserState(state)
+        // بعد از اعمال state اجازهٔ ذخیره بده
+        window.setTimeout(() => {
+          prefsHydrated.current = true
+        }, 0)
+
         const cfg = await api.getConfig()
         const data = cfg.data as { history?: { start_date?: string } } | undefined
-        const sd = data?.history?.start_date
-        if (sd) setStartDate(sd)
+        const cfgStart = data?.history?.start_date
+        const prefsStart = normalizeFormPrefs(state.prefs).startDate
+        const effectiveStart = state.has_prefs ? prefsStart : cfgStart || prefsStart
+        if (!state.has_prefs && cfgStart) setStartDate(cfgStart)
         setConfigText(JSON.stringify(cfg, null, 2))
         await refreshStatus()
-        setLoading(true)
         setCalcNote('در حال بارگذاری / آپدیت داده از دیتابیس...')
-        const s = await api.fetchData(sd, false)
+        const s = await api.fetchData(effectiveStart, false)
         setStatus(s)
         if (!s.ready) {
           showFlash('error', s.error || 'دریافت داده ناموفق بود')
@@ -557,13 +724,78 @@ export default function App() {
           showFlash('success', `داده آماده شد — ${mode}`)
         }
       } catch (e) {
+        prefsHydrated.current = true
         showFlash('error', 'خطا در شروع: ' + String(e))
       } finally {
         setCalcNote(null)
         setLoading(false)
       }
     })()
-  }, [refreshStatus, showFlash])
+  }, [refreshStatus, showFlash, applyUserState])
+
+  useEffect(() => {
+    if (!prefsHydrated.current) return
+    if (prefsSaveTimer.current) window.clearTimeout(prefsSaveTimer.current)
+    prefsSaveTimer.current = window.setTimeout(() => {
+      const prefs: FormPrefs = {
+        startDate,
+        goldSentiment,
+        usdSentiment,
+        months,
+        forecastModel,
+        capital,
+        monthlyBudget,
+        fundAnnual,
+        enableGold,
+        enableUsd,
+        enableFund,
+        enableFintech,
+        enableDirect,
+        enableBankToBank,
+        enableBankToAsset,
+        loanAmount,
+        companyFeePct,
+        bankAnnualPct,
+        repayMonths,
+        feeSource,
+        tomanPerPoint,
+        pointsForLoan,
+        loanForPoints,
+        model3BankAnnual,
+      }
+      void api.userSavePrefs(prefs).catch(() => {
+        /* silent; next edit retries */
+      })
+    }, 450)
+    return () => {
+      if (prefsSaveTimer.current) window.clearTimeout(prefsSaveTimer.current)
+    }
+  }, [
+    startDate,
+    goldSentiment,
+    usdSentiment,
+    months,
+    forecastModel,
+    capital,
+    monthlyBudget,
+    fundAnnual,
+    enableGold,
+    enableUsd,
+    enableFund,
+    enableFintech,
+    enableDirect,
+    enableBankToBank,
+    enableBankToAsset,
+    loanAmount,
+    companyFeePct,
+    bankAnnualPct,
+    repayMonths,
+    feeSource,
+    tomanPerPoint,
+    pointsForLoan,
+    loanForPoints,
+    model3BankAnnual,
+  ])
 
   const dataReady = Boolean(status?.ready)
 
@@ -661,14 +893,26 @@ export default function App() {
     setCalcNote('در حال پیشنهاد بودجه ماهانه از روی اقساط...')
     try {
       const res = await api.investSuggestMonthly(investPayload())
-      setMonthlyBudget(Math.ceil(res.suggested_monthly))
-      setBudgetConfirmed(false)
-      showFlash(
-        'success',
-        res.suggested_monthly > 0
-          ? `پیشنهاد بودجه ماهانه: ${Math.ceil(res.suggested_monthly).toLocaleString('fa-IR')} تومان — تایید کنید.`
-          : 'قسط وام فعالی نبود؛ بودجه ماهانه را دستی وارد کنید.',
-      )
+      const suggested = Math.ceil(res.suggested_monthly)
+      if (suggested > 0) {
+        setMonthlyBudget(suggested)
+        setBudgetConfirmed(false)
+        const title: Record<string, string> = { fintech: 'فین‌تک', bank_loan: 'وام بانکی' }
+        const parts = Object.entries(res.details || {})
+          .map(([k, v]) => `${title[k] || k} ${Math.ceil(Number(v)).toLocaleString('fa-IR')}`)
+          .join('، ')
+        showFlash(
+          'success',
+          `پیشنهاد = مکس اقساط شیوه‌های فعال: ${suggested.toLocaleString('fa-IR')} تومان`
+            + (parts ? ` (${parts})` : '')
+            + ' — تایید کنید.',
+        )
+      } else {
+        showFlash(
+          'info',
+          'بین شیوه‌های فعال قسط وام نبود (مثلاً فقط خرید مستقیم). بودجه را دستی بگذارید.',
+        )
+      }
     } catch (e) {
       showFlash('error', 'پیشنهاد بودجه ناموفق: ' + String(e))
     } finally {
@@ -752,13 +996,31 @@ export default function App() {
           <button
             key={label}
             type="button"
-            className={`step ${step === i ? 'active' : ''} ${i > 0 && !dataReady ? 'locked' : ''}`}
-            onClick={() => goStep(i)}
+            className={`step ${page === 'flow' && step === i ? 'active' : ''} ${i > 0 && !dataReady ? 'locked' : ''}`}
+            onClick={() => {
+              setPage('flow')
+              goStep(i)
+            }}
           >
             <span className="num">{i + 1}</span>
             {label}
           </button>
         ))}
+        <button
+          type="button"
+          className={`step step-extra ${page === 'decisions' ? 'active' : ''}`}
+          onClick={() => {
+            void api.userState().then((s) => {
+              setDecisions(normalizeDecisions(s.decisions))
+              setActiveDecisionId(s.active_decision_id)
+            })
+            setPage('decisions')
+          }}
+        >
+          <span className="num">★</span>
+          تصمیمات اتخاذ شده
+          {decisions.length > 0 ? <span className="step-badge">{decisions.length}</span> : null}
+        </button>
       </nav>
 
       {/* حین لود فقط LoadingBlock؛ toast آبی info تکراری نشان داده نمی‌شود */}
@@ -776,7 +1038,44 @@ export default function App() {
         </div>
       ) : null}
 
-      {step === 0 && (
+      {page === 'decisions' && (
+        <DecisionsPage
+          decisions={decisions}
+          activeId={activeDecisionId}
+          onBack={() => {
+            setPage('flow')
+            setStep(0)
+          }}
+          onSelectOverlay={(id) => {
+            setActiveDecision(id)
+            if (id) {
+              setPage('flow')
+              setStep(0)
+              showFlash('info', 'مسیر تصمیم با رنگ بنفش روی نمودار واقعی افتاد.', 5000)
+            }
+          }}
+          onDelete={async (id) => {
+            try {
+              const state = await api.userDeleteDecision(id)
+              setDecisions(normalizeDecisions(state.decisions))
+              setActiveDecisionId(state.active_decision_id)
+            } catch (e) {
+              showFlash('error', 'حذف تصمیم ناموفق: ' + String(e))
+            }
+          }}
+          onUpdate={(id, patch) => {
+            setDecisions((cur) => cur.map((d) => (d.id === id ? { ...d, ...patch } : d)))
+            if (decisionPatchTimer.current) window.clearTimeout(decisionPatchTimer.current)
+            decisionPatchTimer.current = window.setTimeout(() => {
+              void api.userPatchDecision(id, patch).catch((e) => {
+                showFlash('error', 'بروزرسانی تصمیم ناموفق: ' + String(e))
+              })
+            }, 400)
+          }}
+        />
+      )}
+
+      {page === 'flow' && step === 0 && (
         <section className="panel">
           <h2>مرحله ۱ — آپدیت داده</h2>
           <p className="muted">تا وقتی داده کامل نشود، مراحل بعد قفل‌اند.</p>
@@ -819,18 +1118,60 @@ export default function App() {
                   {status.gold.start_date} → {status.gold.end_date}
                 </span>
               </div>
+              {decisions.length > 0 && (
+                <div className="decision-picker">
+                  <label>
+                    هم‌پوشانی تصمیم خرید روی چارت واقعی
+                    <select
+                      value={activeDecisionId || ''}
+                      onChange={(e) => setActiveDecision(e.target.value || null)}
+                    >
+                      <option value="">— بدون هم‌پوشانی —</option>
+                      {decisions.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.title}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {activeDecision ? (
+                    <p className="muted decision-picker-hint">
+                      <span className="swatch real" /> واقعی &nbsp;
+                      <span className="swatch decision" /> مسیر پیش‌بینی تصمیم
+                      (خط‌چین = روز تصمیم)
+                    </p>
+                  ) : null}
+                </div>
+              )}
               <TradeChart
                 title={status.gold.title}
                 symbol="XAU/USD"
                 unit={status.gold.unit}
                 candles={status.gold.candles}
+                decisionOverlay={toDecisionOverlay(activeDecision, 'gold')}
+                timeframe={chartTf}
+                onTimeframeChange={onChartTfChange}
               />
               <TradeChart
                 title={status.usd.title}
                 symbol="USD/IRT"
                 unit={status.usd.unit}
                 candles={status.usd.candles}
+                decisionOverlay={toDecisionOverlay(activeDecision, 'usd')}
+                timeframe={chartTf}
+                onTimeframeChange={onChartTfChange}
               />
+              {gram18LiveCandles.length > 0 && (
+                <TradeChart
+                  title="گرم طلای ۱۸ عیار — واقعی"
+                  symbol="XAU18/IRT"
+                  unit="تومان"
+                  candles={gram18LiveCandles}
+                  decisionOverlay={toDecisionOverlay(activeDecision, 'gram18')}
+                  timeframe={chartTf}
+                  onTimeframeChange={onChartTfChange}
+                />
+              )}
               <div className="row">
                 <button type="button" className="primary" onClick={() => setStep(1)}>
                   ادامه به پیش‌بینی
@@ -845,7 +1186,7 @@ export default function App() {
         </section>
       )}
 
-      {step === 1 && (
+      {page === 'flow' && step === 1 && (
         <section className="panel">
           <h2>مرحله ۲ — احساس، پیش‌بینی و تایید</h2>
           <p className="muted">اسلایدرها را بکش، پیش‌بینی بزن، نتیجه را ببین؛ اگر راضی بودی تایید کن.</p>
@@ -883,9 +1224,9 @@ export default function App() {
                 value={forecastModel}
                 onChange={(e) => setForecastModel(e.target.value as typeof forecastModel)}
               >
-                <option value="hybrid">Hybrid (بافت تاریخی + احساس)</option>
-                <option value="auto">Auto (Hybrid + LightGBM)</option>
                 <option value="both">Hybrid + LightGBM</option>
+                <option value="auto">Auto (Hybrid + LightGBM)</option>
+                <option value="hybrid">Hybrid (بافت تاریخی + احساس)</option>
                 <option value="lightgbm">LightGBM (بازده + بافت)</option>
                 <option value="prophet">Prophet (بدون فصلی سالانه)</option>
                 <option value="drift">Drift + بافت</option>
@@ -923,6 +1264,13 @@ export default function App() {
                   unit="تومان"
                   series={forecast.usd}
                 />
+                {gram18Forecast && (
+                  <ForecastStatsCard
+                    title="آمار پیش‌بینی گرم ۱۸ (انس × دلار)"
+                    unit="تومان"
+                    series={gram18Forecast}
+                  />
+                )}
               </div>
               <TradeChart
                 title="انس طلا — واقعی / پیش‌بینی"
@@ -930,6 +1278,8 @@ export default function App() {
                 unit={forecast.gold.unit}
                 candles={forecast.gold.historical}
                 forecast={forecast.gold.forecast}
+                timeframe={chartTf}
+                onTimeframeChange={onChartTfChange}
               />
               <TradeChart
                 title="دلار آزاد — واقعی / پیش‌بینی"
@@ -937,7 +1287,26 @@ export default function App() {
                 unit={forecast.usd.unit}
                 candles={forecast.usd.historical}
                 forecast={forecast.usd.forecast}
+                timeframe={chartTf}
+                onTimeframeChange={onChartTfChange}
               />
+              {gram18Forecast && gram18Forecast.historical.length > 0 && (
+                <>
+                  <p className="muted">
+                    گرم ۱۸ عیار = (انس جهانی × دلار آزاد ÷ ۳۱٫۱۰۳) × ۱۸/۲۴ — قیمت ذاتی به تومان
+                    (همان ریال بازار ÷ ۱۰)، بدون اجرت و سود فروشنده.
+                  </p>
+                  <TradeChart
+                    title="گرم طلای ۱۸ عیار — واقعی / پیش‌بینی"
+                    symbol="XAU18/IRT"
+                    unit="تومان"
+                    candles={gram18Forecast.historical}
+                    forecast={gram18Forecast.forecast}
+                    timeframe={chartTf}
+                    onTimeframeChange={onChartTfChange}
+                  />
+                </>
+              )}
               <div className="row">
                 <button
                   type="button"
@@ -949,13 +1318,16 @@ export default function App() {
                     ? 'رفتن به مدل‌های سرمایه‌گذاری'
                     : 'تایید پیش‌بینی و ادامه'}
                 </button>
+                <button type="button" className="ghost" onClick={() => saveBuyDecision(false)} disabled={loading}>
+                  ذخیره اسنپ‌شات تصمیم خرید
+                </button>
               </div>
             </>
           )}
         </section>
       )}
 
-      {step === 2 && (
+      {page === 'flow' && step === 2 && (
         <section className="panel">
           <h2>مرحله ۳ — مدل‌های سرمایه‌گذاری</h2>
           <p className="muted">
@@ -1140,7 +1512,7 @@ export default function App() {
                   />
                 </label>
                 <label>
-                  سود وام بانکی مدل۳ (%) — ۰ = بدون قسط
+                  سود سالانه وام بانکی مدل۳ (%) — ۰ = فقط اصل مساوی
                   <input
                     type="number"
                     value={model3BankAnnual}
@@ -1171,7 +1543,7 @@ export default function App() {
         </section>
       )}
 
-      {step === 3 && (
+      {page === 'flow' && step === 3 && (
         <section className="panel" ref={resultsRef}>
           <h2>مرحله ۴ — مقایسه سود</h2>
           {!invest && !loading && (
@@ -1201,6 +1573,11 @@ export default function App() {
             </>
           )}
           <div className="row">
+            {invest && forecast ? (
+              <button type="button" className="primary" onClick={() => saveBuyDecision(true)} disabled={loading}>
+                ذخیره اسنپ‌شات تصمیم خرید (+ توصیه)
+              </button>
+            ) : null}
             <button type="button" className="ghost" onClick={() => setStep(2)}>
               تغییر ورودی سرمایه‌گذاری
             </button>

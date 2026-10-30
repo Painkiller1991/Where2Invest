@@ -11,19 +11,27 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config_loader import load_config, project_root, save_config
 from app.models.schemas import (
+    ActiveDecisionUpdate,
+    ChartTfUpdate,
     ConfirmForecastRequest,
     ConfigUpdate,
     DataStatus,
+    DecisionMetaUpdate,
+    DecisionUpsert,
     FetchRequest,
     ForecastRequest,
     ForecastResponse,
     InvestCompareResponse,
     InvestInput,
     InvestSuggestResponse,
+    UserImportBundle,
+    UserPrefsUpdate,
+    UserStateResponse,
 )
 from app.services import forecast as forecast_svc
 from app.services.data_fetch import data_gate
 from app.services.invest import compare_methods, suggest_monthly_budget
+from app.services.user_store import user_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -124,6 +132,68 @@ def prediction_models_doc() -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Doc not found")
     return FileResponse(path)
+
+
+@app.get("/api/user/state", response_model=UserStateResponse)
+def user_state() -> UserStateResponse:
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.put("/api/user/prefs", response_model=UserStateResponse)
+def user_prefs_put(body: UserPrefsUpdate) -> UserStateResponse:
+    user_store.save_prefs(body.prefs)
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.put("/api/user/chart-tf", response_model=UserStateResponse)
+def user_chart_tf_put(body: ChartTfUpdate) -> UserStateResponse:
+    user_store.save_chart_tf(body.chart_tf)
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.put("/api/user/active-decision", response_model=UserStateResponse)
+def user_active_decision_put(body: ActiveDecisionUpdate) -> UserStateResponse:
+    try:
+        user_store.set_active_decision(body.active_decision_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="Decision not found") from e
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.post("/api/user/decisions", response_model=UserStateResponse)
+def user_decision_create(body: DecisionUpsert) -> UserStateResponse:
+    try:
+        user_store.upsert_decision(body.decision)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.patch("/api/user/decisions/{decision_id}", response_model=UserStateResponse)
+def user_decision_patch(decision_id: str, body: DecisionMetaUpdate) -> UserStateResponse:
+    try:
+        user_store.update_decision_meta(decision_id, title=body.title, note=body.note)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="Decision not found") from e
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.delete("/api/user/decisions/{decision_id}", response_model=UserStateResponse)
+def user_decision_delete(decision_id: str) -> UserStateResponse:
+    user_store.delete_decision(decision_id)
+    return UserStateResponse(**user_store.get_state())
+
+
+@app.post("/api/user/import", response_model=UserStateResponse)
+def user_import(body: UserImportBundle) -> UserStateResponse:
+    state = user_store.import_bundle(
+        prefs=body.prefs,
+        chart_tf=body.chart_tf,
+        active_decision_id=body.active_decision_id,
+        decisions=body.decisions,
+        only_if_empty=body.only_if_empty,
+    )
+    return UserStateResponse(**state)
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> None:
